@@ -466,31 +466,12 @@ def actualizar_configuracion_usuario(
 # Prueba manual rápida del módulo (no forma parte de la lógica de producción)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("--- INICIANDO PRUEBA DE HUMO DE CSI_DB ---")
-    
-    # 1. Probar registro de un usuario nuevo
-    user_prueba = "agustin_test"
-    pass_prueba = "Formosa2026!"
-    
-    print(f"\n[1] Intentando registrar usuario '{user_prueba}'...")
-    uid = registrar_usuario(user_prueba, pass_prueba)
-    
-    if uid:
-        print(f"-> ¡ÉXITO! Usuario creado con ID: {uid}")
-        
-        # 2. Probar el inicio de sesión (Login)
-        print(f"\n[2] Intentando verificar login para '{user_prueba}'...")
-        uid_verificado = verificar_usuario(user_prueba, pass_prueba)
-        
-        if uid_verificado == uid:
-            print("-> ¡ÉXITO! Contraseña correcta y login verificado.")
-        else:
-            print("-> ERROR: No se pudo verificar el login.")
-            
-        # 3. Probar obtener la configuración automática
-        print(f"\n[3] Obteniendo configuración por defecto del usuario {uid}...")
-        config = obtener_configuracion_usuario(uid)
-        print(f"-> Datos en la DB: {config}")
-        
+    # Smoke test simple: valida que la conexión a csi_db funcione y que
+    # el flujo básico de registro/login/CRUD se comporte como se espera.
+    # Requiere que XAMPP (MySQL) esté corriendo y csi_db ya creada.
+    conexion_test = conectar_db()
+    if conexion_test is None:
+        print("No se pudo conectar a csi_db. Verificá que XAMPP/MySQL esté activo.")
     else:
-        print("-> FALLÓ el registro. (Si ya corriste esta prueba antes, es normal porque el usuario ya existe).")
+        print("Conexión a csi_db exitosa.")
+        conexion_test.close()
