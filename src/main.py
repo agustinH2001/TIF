@@ -3,27 +3,37 @@ main.py
 =======
 
 Script ejecutable principal del Sistema de Detección Pasiva de Movimiento
-por CSI Wi-Fi. Orquesta el ciclo de vida completo del sistema corriendo
-en modo local (Raspberry Pi + XAMPP/MySQL):
+por CSI Wi-Fi — MODO EN VIVO (streaming TCP).
 
-    1. Autenticación de usuario                (src.database.database)
-    2. Carga de configuración personalizada     (src.database.database)
-    3. Inicialización del motor DSP             (src.processing.signal_filter)
-    4. Streaming de ventanas CSI -> filtrado -> trigger -> persistencia
-                                                 (src.parser.parser_csi +
-                                                  src.processing.signal_filter)
+Reemplaza a la versión anterior (que generaba ráfagas sintéticas para
+validar la lógica de DSP) ahora que el hardware ya captura datos CSI
+reales. Este orquestador:
 
-Nota de estado del hardware (MVP 1):
-    Al momento de escribir este orquestador, la Raspberry Pi con Nexmon
-    CSI sólo está capturando un único paquete por limitaciones temporales
-    de hardware. Por eso este script usa `extraer_csi()` para tomar la
-    firma de amplitud REAL de ese paquete como plantilla base, y genera
-    matemáticamente ráfagas sintéticas de paquetes sobre esa plantilla
-    para poder validar el pipeline de DSP de punta a punta mientras se
-    resuelve la captura continua real. Cuando el hardware esté estable,
-    el bloque 4 de este script se reemplaza por una lectura continua de
-    ventanas reales (o un socket/cola alimentada por el proceso de
-    captura), sin tener que tocar el resto del pipeline.
+    1. Autentica al usuario y carga su configuración      (BD)
+    2. Levanta un servidor TCP que recibe, en vivo, el      (sockets)
+       stream pcap que la Raspberry Pi envía por red
+    3. Reconstruye cada trama con Scapy y reutiliza los     (parser_csi)
+       extractores internos del parser offline
+    4. Acumula los vectores de amplitud en una ventana       (signal_filter)
+       deslizante y dispara el pipeline de DSP + persistencia
+       cada vez que la ventana se llena
+
+Cómo llega el stream:
+    La Raspberry Pi corre `tcpdump` en modo escritura-a-stdout ("-w -")
+    sobre la interfaz en modo monitor con Nexmon CSI activo, y entuba
+    esa salida por `netcat` hacia este servidor. El comando EXACTO a
+    correr en la Raspberry Pi se imprime en pantalla al arrancar este
+    script (ver `_imprimir_instrucciones_raspberry_pi`), porque depende
+    de la IP de esta PC en el momento de ejecutar.
+
+    El resultado es, ni más ni menos, un archivo .pcap normal pero
+    entregado por un socket en lugar de por disco: primero viaja la
+    cabecera global de 24 bytes, y después, para cada paquete
+    capturado, una cabecera de registro de 16 bytes (que informa cuántos
+    bytes de datos siguen) seguida de esos bytes crudos de la trama.
+
+Requisitos:
+    pip install scapy numpy
 
 Ejecución:
     Desde la raíz del proyecto:  python src/main.py
@@ -31,26 +41,34 @@ Ejecución:
 """
 
 import logging
+import socket
+import struct
 import sys
-import time
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Deque, Optional, Tuple
 
 import numpy as np
+from scapy.all import Ether
 
 # ---------------------------------------------------------------------------
 # Resolución de rutas / imports
 # ---------------------------------------------------------------------------
-# Este archivo vive en <raiz_proyecto>/src/main.py, por lo que su
-# directorio padre directo YA es la raíz del proyecto. Se agrega a
-# sys.path para que los imports absolutos "src.<modulo>" funcionen sin
-# importar desde dónde se invoque el script (raíz o dentro de src/).
 RAIZ_PROYECTO = Path(__file__).resolve().parent.parent
 if str(RAIZ_PROYECTO) not in sys.path:
     sys.path.insert(0, str(RAIZ_PROYECTO))
 
 from src.database.database import obtener_configuracion_usuario, verificar_usuario
-from src.parser.parser_csi import extraer_csi
+
+# Nota de arquitectura: `_extraer_payload_csi` y `_calcular_amplitud_fase`
+# están marcadas como privadas (prefijo "_") en parser_csi.py porque ahí
+# son detalles internos de `extraer_csi()`. Acá las reutilizamos a
+# propósito para no duplicar la lógica de filtrado/decodificación de
+# Nexmon CSI entre el modo offline (archivo .pcap) y el modo online
+# (socket en vivo) — la misma trama, venga de donde venga, se procesa
+# exactamente igual. Si este patrón se repite en un tercer lugar,
+# convendría promoverlas a funciones públicas de un módulo común.
+from src.parser.parser_csi import _calcular_amplitud_fase, _extraer_payload_csi
 from src.processing.signal_filter import DetectorMovimiento, FRECUENCIA_MUESTREO_DEFAULT_HZ
 
 # ---------------------------------------------------------------------------
@@ -63,54 +81,62 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ---------------------------------------------------------------------------
-# Constantes de la simulación / configuración del sistema
+# Constantes de sesión / autenticación
 # ---------------------------------------------------------------------------
-
-# Credenciales de la sesión simulada. En una futura interfaz (CLI, API o
-# panel web) esto vendría de un formulario de login real, no hardcodeado.
 USERNAME_DEMO = "agustin_test"
 PASSWORD_DEMO = "Formosa2026!"
 
-# Archivo .pcap real capturado por el MVP 1 (Raspberry Pi + Nexmon CSI).
-RUTA_PCAP_REAL = RAIZ_PROYECTO / "data" / "raw" / "csi_test.pcap"
+# ---------------------------------------------------------------------------
+# Constantes del servidor TCP
+# ---------------------------------------------------------------------------
+HOST = "0.0.0.0"
+PORT = 9999
 
-# Tamaño de cada ventana/bloque de análisis, en cantidad de paquetes CSI.
-# Nota: la tasa de muestreo (FRECUENCIA_MUESTREO_DEFAULT_HZ, importada de
-# signal_filter) determina cuántos segundos reales representa este bloque;
-# con el default de 100 Hz, 200 paquetes equivalen a una ventana de 2s.
-TAMANO_BLOQUE = 200
+# Si no llega ni un solo byte nuevo en este tiempo, se asume que la
+# Raspberry Pi perdió la conexión (se cortó el Wi-Fi, se reinició
+# tcpdump, se le fue la luz, etc.) y se vuelve a esperar una conexión
+# nueva, en vez de quedar bloqueado esperando para siempre.
+TIMEOUT_INACTIVIDAD_SEG = 30.0
 
-# Parámetros de la perturbación de movimiento simulada (banda de pasos).
-FRECUENCIA_MOVIMIENTO_HZ = 1.2
-AMPLITUD_MOVIMIENTO = 15.0
+# ---------------------------------------------------------------------------
+# Constantes del formato de streaming pcap
+# ---------------------------------------------------------------------------
+LONGITUD_CABECERA_GLOBAL_PCAP = 24
+LONGITUD_CABECERA_PAQUETE_PCAP = 16
 
-# Cantidad de subportadoras a usar como fallback si el .pcap real no
-# entrega ningún paquete válido (ver `obtener_firma_csi_real`).
-N_SUBPORTADORAS_FALLBACK = 64
+# Cota superior razonable para el tamaño de un paquete (frame Ethernet).
+# Sirve para detectar un stream desincronizado: si "incl_len" da un
+# número disparatado, es señal de que dejamos de leer los bytes
+# alineados a un registro real, y no hay forma confiable de recuperarse
+# más que cerrar la conexión y esperar una nueva.
+LONGITUD_MAXIMA_PAQUETE_RAZONABLE = 65535
+
+MAGIC_NUMBER_US = 0xA1B2C3D4  # timestamps con resolución de microsegundos
+MAGIC_NUMBER_NS = 0xA1B23C4D  # timestamps con resolución de nanosegundos
+
+# ---------------------------------------------------------------------------
+# Constantes de la ventana deslizante
+# ---------------------------------------------------------------------------
+TAMANO_VENTANA = 200       # paquetes por ventana de análisis DSP
+PASO_DESLIZAMIENTO = 20    # paquetes viejos que se descartan tras cada análisis
+
+
+class ErrorProtocoloPcap(Exception):
+    """El stream recibido no respeta el formato pcap esperado (posible desincronización)."""
 
 
 # ---------------------------------------------------------------------------
-# Paso 1: Autenticación
+# Paso 1: Autenticación y configuración (igual que en la versión anterior)
 # ---------------------------------------------------------------------------
 def autenticar_usuario() -> Optional[int]:
-    """
-    Simula el inicio de sesión de un usuario ya registrado en el sistema,
-    invocando la misma función de verificación que usaría cualquier
-    interfaz real (CLI, API, panel web).
-
-    Returns:
-        El usuario_id si la autenticación fue exitosa, None en caso
-        contrario (usuario inexistente, contraseña incorrecta, o base de
-        datos no disponible).
-    """
+    """Simula el inicio de sesión invocando la misma verificación que usaría cualquier interfaz real."""
     logger.info(f"Autenticando usuario '{USERNAME_DEMO}'...")
     usuario_id = verificar_usuario(USERNAME_DEMO, PASSWORD_DEMO)
 
     if usuario_id is None:
         logger.error(
-            f"Autenticación fallida para '{USERNAME_DEMO}'. Verificá que: "
-            f"(1) XAMPP/MySQL esté corriendo, (2) el usuario exista en "
-            f"csi_db.usuarios (podés crearlo con registrar_usuario())."
+            f"Autenticación fallida para '{USERNAME_DEMO}'. Verificá que XAMPP/MySQL "
+            f"esté corriendo y que el usuario exista en csi_db.usuarios."
         )
         return None
 
@@ -118,145 +144,367 @@ def autenticar_usuario() -> Optional[int]:
     return usuario_id
 
 
-# ---------------------------------------------------------------------------
-# Paso 2: Carga de configuración
-# ---------------------------------------------------------------------------
 def cargar_configuracion(usuario_id: int) -> Optional[dict]:
-    """
-    Recupera la configuración personalizada del usuario (umbral de
-    sensibilidad, canal Wi-Fi, BSSID objetivo) desde `configuracion_sistema`.
-
-    Args:
-        usuario_id: ID del usuario autenticado.
-
-    Returns:
-        dict con la configuración, o None si no existe/hubo un error.
-    """
+    """Recupera umbral_sensibilidad, canal_wifi y bssid_objetivo desde configuracion_sistema."""
     logger.info(f"Cargando configuración del sistema (usuario_id={usuario_id})...")
     config = obtener_configuracion_usuario(usuario_id)
 
     if config is None:
-        logger.error(
-            f"No se encontró configuración para usuario_id={usuario_id}. "
-            f"Todo usuario creado con registrar_usuario() debería tener una "
-            f"fila por defecto en configuracion_sistema."
-        )
+        logger.error(f"No se encontró configuración para usuario_id={usuario_id}.")
         return None
 
     logger.info(
-        f"Configuración cargada -> umbral_sensibilidad="
-        f"{config['umbral_sensibilidad']}, canal_wifi={config['canal_wifi']}, "
-        f"bssid_objetivo={config['bssid_objetivo']}"
+        f"Configuración cargada -> umbral_sensibilidad={config['umbral_sensibilidad']}, "
+        f"canal_wifi={config['canal_wifi']}, bssid_objetivo={config['bssid_objetivo']}"
     )
     return config
 
 
 # ---------------------------------------------------------------------------
-# Paso 4 (preparación): firma CSI real + generación de ráfagas sintéticas
+# Paso 2: Desempaquetado robusto del stream pcap sobre el socket TCP
 # ---------------------------------------------------------------------------
-def obtener_firma_csi_real() -> np.ndarray:
+def _recibir_exacto(conexion: socket.socket, n_bytes: int) -> Optional[bytes]:
     """
-    Extrae, con el parser real (`extraer_csi`), la matriz de amplitud del
-    (por ahora único) paquete CSI disponible en `data/raw/csi_test.pcap`.
+    Lee exactamente `n_bytes` de un socket TCP.
 
-    Esta firma se usa como plantilla base para generar sintéticamente
-    las ráfagas de prueba del paso 4, en lugar de partir de un vector de
-    ceros o de ruido puramente artificial: así la simulación conserva la
-    "forma" real de amplitud por subportadora del entorno capturado.
+    Los sockets TCP son de flujo continuo: un solo `recv()` puede
+    devolver menos bytes de los pedidos (por ejemplo, si el paquete de
+    red llegó fragmentado). Por eso hay que iterar hasta completar el
+    total solicitado en lugar de confiar en una única llamada.
 
     Returns:
-        np.ndarray de forma (1, n_subportadoras) con la firma real, o un
-        vector de fallback (DC constante) si el .pcap no tiene paquetes
-        CSI válidos.
+        bytes de longitud exacta `n_bytes`, o None si la conexión se
+        cerró (recv() devolvió b"") antes de completar la lectura.
     """
-    logger.info(f"Extrayendo firma CSI real desde '{RUTA_PCAP_REAL.name}'...")
-    matriz_real = extraer_csi(str(RUTA_PCAP_REAL))
+    buffer = bytearray()
+    while len(buffer) < n_bytes:
+        fragmento = conexion.recv(n_bytes - len(buffer))
+        if not fragmento:
+            return None  # el peer cerró la conexión
+        buffer.extend(fragmento)
+    return bytes(buffer)
 
-    if matriz_real.size == 0:
-        logger.warning(
-            "El .pcap real no entregó paquetes CSI válidos (hardware aún "
-            "limitado). Se usa una firma de base genérica para poder "
-            "seguir validando la lógica de DSP."
-        )
-        return np.full((1, N_SUBPORTADORAS_FALLBACK), 100.0)
 
-    logger.info(
-        f"Firma real obtenida: {matriz_real.shape[0]} paquete(s) x "
-        f"{matriz_real.shape[1]} subportadoras."
+def _leer_cabecera_global(conexion: socket.socket) -> Optional[Tuple[str, bool]]:
+    """
+    Lee la cabecera global de 24 bytes del stream pcap y determina, a
+    partir del "magic number", el orden de bytes (endianness) y la
+    resolución temporal (microsegundos o nanosegundos) del resto del
+    stream.
+
+    Returns:
+        Tupla (orden_bytes, es_nanosegundos), donde orden_bytes es '<'
+        (little-endian) o '>' (big-endian). None si la cabecera es
+        inválida o la conexión se cerró antes de completarla.
+    """
+    cabecera = _recibir_exacto(conexion, LONGITUD_CABECERA_GLOBAL_PCAP)
+    if cabecera is None:
+        return None
+
+    for orden_bytes in ("<", ">"):
+        magic = struct.unpack(f"{orden_bytes}I", cabecera[:4])[0]
+        if magic == MAGIC_NUMBER_US:
+            return orden_bytes, False
+        if magic == MAGIC_NUMBER_NS:
+            return orden_bytes, True
+
+    logger.error(
+        f"Magic number de pcap desconocido ({cabecera[:4].hex()}). "
+        f"¿El stream realmente viene de 'tcpdump -w -'?"
     )
-    return matriz_real
+    return None
 
 
-def generar_bloque_reposo(
-    firma_base: np.ndarray, n_paquetes: int, rng: np.random.Generator
-) -> np.ndarray:
+def _recibir_siguiente_paquete(
+    conexion: socket.socket, orden_bytes: str, es_nanosegundos: bool
+) -> Optional[Tuple[bytes, float]]:
     """
-    Genera un bloque sintético de "reposo": repite la firma de amplitud
-    real capturada (una fila) a lo largo de `n_paquetes` y le suma
-    únicamente ruido blanco de baja intensidad, sin ninguna componente
-    de movimiento. Simula un entorno estático.
+    Lee un registro completo de paquete del stream pcap: la cabecera de
+    16 bytes (timestamp + incl_len + orig_len) y, a continuación,
+    exactamente `incl_len` bytes de datos crudos de la trama.
 
     Args:
-        firma_base: matriz (>=1, n_subportadoras) con la firma real de
-            referencia; se usa su primera fila como plantilla.
-        n_paquetes: cantidad de paquetes a generar en el bloque.
-        rng: generador de números aleatorios de NumPy.
+        conexion: socket ya conectado, con la cabecera global ya leída.
+        orden_bytes: '<' o '>', tal como lo devolvió `_leer_cabecera_global`.
+        es_nanosegundos: resolución temporal del campo de timestamp.
 
     Returns:
-        np.ndarray de forma (n_paquetes, n_subportadoras).
+        Tupla (bytes_de_la_trama, timestamp_epoch_segundos), o None si
+        la conexión se cerró de forma prolija (fin de stream).
+
+    Raises:
+        ErrorProtocoloPcap: si `incl_len` da un valor fuera de rango
+            razonable, señal de que el stream se desincronizó y ya no
+            se puede confiar en el alineamiento de los bytes siguientes.
     """
-    plantilla = firma_base[0]
-    n_subportadoras = plantilla.shape[0]
-    ruido = rng.normal(0, 0.5, size=(n_paquetes, n_subportadoras))
-    return plantilla + ruido
+    cabecera = _recibir_exacto(conexion, LONGITUD_CABECERA_PAQUETE_PCAP)
+    if cabecera is None:
+        return None  # fin de stream prolijo
 
+    ts_principal, ts_fraccion, incl_len, _orig_len = struct.unpack(
+        f"{orden_bytes}IIII", cabecera
+    )
 
-def generar_bloque_movimiento(
-    firma_base: np.ndarray,
-    n_paquetes: int,
-    frecuencia_muestreo: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """
-    Genera un bloque sintético con una perturbación de movimiento
-    humano: sobre la misma firma base + ruido, se superpone una onda
-    senoidal de ~1.2 Hz (banda típica de pasos) que emula la variación
-    de amplitud inducida por una persona moviéndose en el área cubierta.
+    if not (0 < incl_len <= LONGITUD_MAXIMA_PAQUETE_RAZONABLE):
+        raise ErrorProtocoloPcap(
+            f"incl_len fuera de rango razonable: {incl_len} bytes."
+        )
 
-    Args:
-        firma_base: matriz (>=1, n_subportadoras) con la firma real de
-            referencia; se usa su primera fila como plantilla.
-        n_paquetes: cantidad de paquetes a generar en el bloque.
-        frecuencia_muestreo: tasa de paquetes por segundo (Hz), usada
-            para construir el eje temporal de la senoidal.
-        rng: generador de números aleatorios de NumPy.
+    datos = _recibir_exacto(conexion, incl_len)
+    if datos is None:
+        return None  # se cortó a mitad de un paquete: se trata como fin de stream
 
-    Returns:
-        np.ndarray de forma (n_paquetes, n_subportadoras).
-    """
-    plantilla = firma_base[0]
-    n_subportadoras = plantilla.shape[0]
+    divisor = 1_000_000_000.0 if es_nanosegundos else 1_000_000.0
+    timestamp = ts_principal + (ts_fraccion / divisor)
 
-    t = np.arange(n_paquetes) / frecuencia_muestreo
-    señal_movimiento = AMPLITUD_MOVIMIENTO * np.sin(2 * np.pi * FRECUENCIA_MOVIMIENTO_HZ * t)
-
-    ruido = rng.normal(0, 0.5, size=(n_paquetes, n_subportadoras))
-
-    # señal_movimiento[:, np.newaxis] transmite (broadcast) la misma
-    # perturbación temporal a todas las subportadoras por igual; en una
-    # señal CSI real cada subportadora respondería con una fase/ganancia
-    # levemente distinta, pero para validar la lógica de trigger esta
-    # aproximación es suficiente.
-    return plantilla + ruido + señal_movimiento[:, np.newaxis]
+    return datos, timestamp
 
 
 # ---------------------------------------------------------------------------
-# Utilidad de reporte en consola
+# Paso 3: Reconstrucción con Scapy + reutilización del parser interno
 # ---------------------------------------------------------------------------
-def _imprimir_resultado(resultado: dict) -> None:
-    print(f"  Varianza promedio (filtrada) : {resultado['varianza_promedio']:.4f}")
-    print(f"  ¿Movimiento detectado?       : {resultado['movimiento_detectado']}")
-    print(f"  ¿Evento nuevo en la BD?      : {resultado['evento_registrado']}")
+def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
+    """
+    Reconstruye la trama de red con Scapy (`Ether(datos_ethernet)`) en
+    lugar de recortar bytes de forma estática (por ejemplo `[42:]`), que
+    se rompería apenas la cabecera IP tuviera opciones o cualquier campo
+    variara en longitud. Scapy disecciona Ethernet/IP/UDP de forma
+    correcta sin importar el tamaño real de cada cabecera.
+
+    Reutiliza los mismos extractores internos del parser offline para
+    que una trama CSI se procese exactamente igual, venga de un archivo
+    .pcap o de este stream en vivo.
+
+    Returns:
+        Vector de amplitud (np.ndarray, una posición por subportadora),
+        o None si la trama no es una trama CSI de Nexmon válida.
+    """
+    try:
+        paquete = Ether(datos_ethernet)
+    except Exception as e:
+        logger.debug(f"Scapy no pudo reconstruir la trama recibida: {e}")
+        return None
+
+    datos_iq = _extraer_payload_csi(paquete)
+    if datos_iq is None:
+        return None  # no era una trama CSI (puerto/MAC no coinciden)
+
+    amplitud, _fase = _calcular_amplitud_fase(datos_iq)
+    if amplitud.size == 0:
+        return None
+
+    return amplitud
+
+
+# ---------------------------------------------------------------------------
+# Paso 4: Ventana deslizante + disparo del pipeline de DSP
+# ---------------------------------------------------------------------------
+def _procesar_stream(conexion: socket.socket, detector: DetectorMovimiento) -> None:
+    """
+    Consume el stream pcap de una conexión ya aceptada: lee la cabecera
+    global, y después entra en un loop que arma la ventana deslizante de
+    amplitudes y dispara `detector.procesar_ventana()` cada vez que se
+    junta un bloque completo de `TAMANO_VENTANA` paquetes CSI válidos.
+
+    Vuelve (return) apenas la conexión se cierra o se detecta un
+    problema irrecuperable, dejando que `_ejecutar_servidor` acepte una
+    nueva conexión sin caerse.
+    """
+    resultado_cabecera = _leer_cabecera_global(conexion)
+    if resultado_cabecera is None:
+        logger.error("No se pudo leer una cabecera global de pcap válida. Cerrando conexión.")
+        return
+
+    orden_bytes, es_nanosegundos = resultado_cabecera
+    logger.info(
+        f"Cabecera global de pcap OK "
+        f"(orden de bytes: {'little-endian' if orden_bytes == '<' else 'big-endian'}, "
+        f"resolución: {'nanosegundos' if es_nanosegundos else 'microsegundos'})."
+    )
+
+    # Cada elemento del buffer es (vector_amplitud, timestamp_del_paquete).
+    # El timestamp se usa sólo para estimar la frecuencia de muestreo real
+    # de esta ventana (ver más abajo) y comparala con la que asume el filtro.
+    buffer_ventana: Deque[Tuple[np.ndarray, float]] = deque(maxlen=TAMANO_VENTANA)
+
+    n_subportadoras_esperado: Optional[int] = None
+    n_paquetes_csi = 0
+    n_paquetes_descartados = 0
+
+    while True:
+        try:
+            resultado_paquete = _recibir_siguiente_paquete(conexion, orden_bytes, es_nanosegundos)
+        except ErrorProtocoloPcap as e:
+            logger.error(f"Stream pcap desincronizado ({e}). Cerrando conexión.")
+            return
+
+        if resultado_paquete is None:
+            logger.info("La Raspberry Pi cerró la conexión (fin del stream).")
+            return
+
+        datos_trama, timestamp_paquete = resultado_paquete
+
+        vector_amplitud = _procesar_paquete_crudo(datos_trama)
+        if vector_amplitud is None:
+            n_paquetes_descartados += 1
+            continue
+
+        # Validación de consistencia: todas las ventanas deben tener la
+        # misma cantidad de subportadoras para poder apilarse en una
+        # matriz rectangular.
+        if n_subportadoras_esperado is None:
+            n_subportadoras_esperado = vector_amplitud.shape[0]
+        elif vector_amplitud.shape[0] != n_subportadoras_esperado:
+            logger.warning(
+                f"Paquete CSI con {vector_amplitud.shape[0]} subportadoras "
+                f"(se esperaban {n_subportadoras_esperado}). Se descarta."
+            )
+            n_paquetes_descartados += 1
+            continue
+
+        n_paquetes_csi += 1
+        buffer_ventana.append((vector_amplitud, timestamp_paquete))
+
+        if len(buffer_ventana) == TAMANO_VENTANA:
+            _procesar_ventana_completa(buffer_ventana, detector, n_paquetes_csi, n_paquetes_descartados)
+
+            # Ventana deslizante: se descartan los PASO_DESLIZAMIENTO
+            # paquetes más viejos en vez de esperar a juntar 200 paquetes
+            # nuevos de cero. Así la ventana avanza de a saltos chicos
+            # (más resolución temporal) sin tener que correr el filtro
+            # Butterworth en CADA paquete que llega (carísimo en tiempo real).
+            for _ in range(PASO_DESLIZAMIENTO):
+                buffer_ventana.popleft()
+
+
+def _procesar_ventana_completa(
+    buffer_ventana: Deque[Tuple[np.ndarray, float]],
+    detector: DetectorMovimiento,
+    n_paquetes_csi: int,
+    n_paquetes_descartados: int,
+) -> None:
+    """
+    Convierte el buffer circular actual en una matriz de NumPy y la
+    envía al motor de DSP (`DetectorMovimiento`), que se encarga de
+    filtrar, calcular la varianza, evaluar el trigger, y persistir el
+    evento en MySQL si corresponde.
+    """
+    vectores = [item[0] for item in buffer_ventana]
+    timestamps = [item[1] for item in buffer_ventana]
+
+    matriz_ventana = np.array(vectores)
+
+    duracion_ventana_seg = timestamps[-1] - timestamps[0]
+    fs_estimada = (
+        (len(timestamps) - 1) / duracion_ventana_seg if duracion_ventana_seg > 0 else None
+    )
+
+    resultado = detector.procesar_ventana(matriz_ventana)
+
+    estado_legible = "MOVIMIENTO" if resultado["movimiento_detectado"] else "reposo"
+    mensaje_fs = (
+        f"fs_real≈{fs_estimada:.1f}Hz (asumida={FRECUENCIA_MUESTREO_DEFAULT_HZ}Hz)"
+        if fs_estimada is not None
+        else "fs_real=N/D"
+    )
+    logger.info(
+        f"[Ventana procesada] estado={estado_legible} | "
+        f"varianza={resultado['varianza_promedio']:.4f} | "
+        f"evento_nuevo_en_BD={resultado['evento_registrado']} | "
+        f"{mensaje_fs} | "
+        f"paquetes_csi_totales={n_paquetes_csi} | descartados={n_paquetes_descartados}"
+    )
+
+    # Si la fs real se aleja mucho de la asumida por el filtro, el
+    # pasabanda de signal_filter.py estaría mirando una banda de
+    # frecuencia distinta a la que corresponde. Se avisa para que se
+    # pueda ajustar FRECUENCIA_MUESTREO_DEFAULT_HZ en signal_filter.py.
+    if fs_estimada is not None and abs(fs_estimada - FRECUENCIA_MUESTREO_DEFAULT_HZ) > (
+        0.25 * FRECUENCIA_MUESTREO_DEFAULT_HZ
+    ):
+        logger.warning(
+            f"La frecuencia de muestreo real (~{fs_estimada:.1f} Hz) difiere "
+            f"más de un 25% de la asumida en el filtro "
+            f"({FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz). Conviene actualizar "
+            f"FRECUENCIA_MUESTREO_DEFAULT_HZ en signal_filter.py."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Servidor TCP: acepta conexiones y sobrevive a desconexiones de la RPi
+# ---------------------------------------------------------------------------
+def _obtener_ip_local_probable() -> str:
+    """
+    Determina la IP de esta PC en la red local, para poder mostrarla en
+    las instrucciones de la Raspberry Pi. Usa el truco de "conectar" un
+    socket UDP hacia una IP externa sin enviar ningún dato realmente
+    (UDP connect() sólo fija el destino por defecto; no transmite nada
+    por sí solo), únicamente para que el sistema operativo elija qué
+    interfaz de red usaría para llegar hasta ahí.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "<IP_DE_TU_PC>"
+
+
+def _imprimir_instrucciones_raspberry_pi() -> None:
+    """Imprime el comando exacto a correr en la Raspberry Pi para iniciar el envío del stream."""
+    ip_local = _obtener_ip_local_probable()
+    comando = f"sudo tcpdump -i wlan0 -U -w - udp port 5500 | nc {ip_local} {PORT}"
+
+    print("=" * 72)
+    print(" COMANDO A CORRER EN LA RASPBERRY PI")
+    print("=" * 72)
+    print(f"\n  {comando}\n")
+    print(
+        "  -i wlan0   : interfaz en modo monitor con Nexmon CSI activo\n"
+        "               (cambiala si tu interfaz se llama distinto).\n"
+        "  -U         : vuelca cada paquete apenas se captura, sin bufferear\n"
+        "               por bloques; sin esto, el stream llega demorado y a\n"
+        "               las trompadas en vez de en tiempo real.\n"
+        "  -w -       : escribe la captura en formato pcap por stdout en vez\n"
+        "               de a un archivo.\n"
+        f"  nc {ip_local} {PORT} : entuba ese stdout por TCP hacia este servidor.\n"
+    )
+    print("=" * 72 + "\n")
+
+
+def _ejecutar_servidor(detector: DetectorMovimiento) -> None:
+    """
+    Levanta el servidor TCP y acepta conexiones en un loop infinito: si
+    la Raspberry Pi se desconecta (Wi-Fi caído, tcpdump reiniciado,
+    corte de luz, etc.), vuelve a esperar una conexión nueva en lugar de
+    terminar el proceso.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
+        servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        servidor.bind((HOST, PORT))
+        servidor.listen(1)
+
+        logger.info(f"Servidor TCP escuchando en {HOST}:{PORT}.")
+        _imprimir_instrucciones_raspberry_pi()
+        logger.info("Esperando a que la Raspberry Pi se conecte...")
+
+        while True:  # loop de aceptación: sobrevive a desconexiones individuales
+            conexion, direccion = servidor.accept()
+            conexion.settimeout(TIMEOUT_INACTIVIDAD_SEG)
+            logger.info(f"Raspberry Pi conectada desde {direccion[0]}:{direccion[1]}.")
+
+            try:
+                _procesar_stream(conexion, detector)
+            except (socket.timeout, TimeoutError):
+                logger.warning(
+                    f"No llegaron datos en {TIMEOUT_INACTIVIDAD_SEG:.0f}s: se asume que "
+                    f"la Raspberry Pi perdió la conexión."
+                )
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                logger.warning(f"Conexión con la Raspberry Pi interrumpida: {e}")
+            finally:
+                conexion.close()
+                logger.info("Conexión cerrada. Esperando una nueva conexión...\n")
 
 
 # ---------------------------------------------------------------------------
@@ -265,27 +513,17 @@ def _imprimir_resultado(resultado: dict) -> None:
 def main() -> None:
     print("=" * 72)
     print(" SISTEMA DE DETECCIÓN PASIVA DE MOVIMIENTO POR CSI WI-FI")
-    print(" Orquestador principal (src/main.py) - modo local XAMPP/MySQL")
+    print(" Orquestador principal (src/main.py) - MODO EN VIVO (streaming TCP)")
     print("=" * 72)
 
-    # --- Paso 1: Autenticación ---------------------------------------
     usuario_id = autenticar_usuario()
     if usuario_id is None:
         sys.exit(1)
 
-    # --- Paso 2: Configuración ----------------------------------------
     config = cargar_configuracion(usuario_id)
     if config is None:
         sys.exit(1)
 
-    print(
-        f"\n[Info] canal_wifi={config['canal_wifi']} y "
-        f"bssid_objetivo={config['bssid_objetivo']} quedan disponibles "
-        f"para el futuro módulo de captura (MVP 1); no son consumidos "
-        f"por el motor DSP, que sólo necesita el umbral de sensibilidad."
-    )
-
-    # --- Paso 3: Inicialización del motor DSP --------------------------
     detector = DetectorMovimiento(
         usuario_id=usuario_id,
         umbral_sensibilidad=config["umbral_sensibilidad"],
@@ -296,46 +534,13 @@ def main() -> None:
         f"{config['umbral_sensibilidad']} y fs={FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz."
     )
 
-    # --- Preparación del stream simulado --------------------------------
-    firma_real = obtener_firma_csi_real()
-    rng = np.random.default_rng(seed=7)
-
-    # --- Paso 4: Streaming de ventanas CSI ------------------------------
-    print("\n" + "-" * 72)
-    print(f"BLOQUE 1/2: simulando {TAMANO_BLOQUE} paquetes de REPOSO (entorno estático)")
-    print("-" * 72)
-    bloque_reposo = generar_bloque_reposo(firma_real, TAMANO_BLOQUE, rng)
-    resultado_reposo = detector.procesar_ventana(bloque_reposo)
-    _imprimir_resultado(resultado_reposo)
-
-    time.sleep(1)  # simula el intervalo real entre ventanas del stream continuo
-
-    print("\n" + "-" * 72)
-    print(
-        f"BLOQUE 2/2: simulando {TAMANO_BLOQUE} paquetes con MOVIMIENTO "
-        f"(perturbación ~{FRECUENCIA_MOVIMIENTO_HZ} Hz)"
-    )
-    print("-" * 72)
-    bloque_movimiento = generar_bloque_movimiento(
-        firma_real, TAMANO_BLOQUE, FRECUENCIA_MUESTREO_DEFAULT_HZ, rng
-    )
-    resultado_movimiento = detector.procesar_ventana(bloque_movimiento)
-    _imprimir_resultado(resultado_movimiento)
-
-    # --- Resumen final ----------------------------------------------------
-    print("\n" + "=" * 72)
-    if resultado_movimiento["evento_registrado"]:
-        print(
-            "✔ Evento de movimiento persistido en 'registro_movimiento' (csi_db).\n"
-            "  Revisá phpMyAdmin para confirmar la fila insertada."
-        )
-    else:
-        print(
-            "✘ El evento no se persistió en la base de datos.\n"
-            "  Revisá el log de errores más arriba (¿XAMPP/MySQL corriendo? "
-            "¿el usuario existe en csi_db?)."
-        )
-    print("=" * 72)
+    try:
+        _ejecutar_servidor(detector)
+    except KeyboardInterrupt:
+        logger.info("Servidor detenido manualmente (Ctrl+C). Cerrando.")
+    except OSError as e:
+        logger.error(f"No se pudo levantar el servidor TCP en {HOST}:{PORT}: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
