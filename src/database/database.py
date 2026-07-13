@@ -33,6 +33,7 @@ import bcrypt
 import mysql.connector
 from mysql.connector import Error
 from mysql.connector.connection import MySQLConnection
+from mysql.connector.constants import ClientFlag
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,6 +52,16 @@ DB_CONFIG = {
     "user": "root",
     "password": "",
     "database": "csi_db",
+    # CLIENT_FOUND_ROWS: por defecto, MySQL informa en `cursor.rowcount`
+    # la cantidad de filas MODIFICADAS por un UPDATE, no las ENCONTRADAS.
+    # Esto es una trampa clásica: si se hace UPDATE con un valor idéntico
+    # al que ya estaba guardado, rowcount da 0 aunque la fila exista y la
+    # operación haya sido exitosa. Con este flag, rowcount pasa a contar
+    # filas encontradas (coincidentes con el WHERE), que es lo que
+    # `actualizar_configuracion_usuario` necesita para distinguir
+    # correctamente "usuario sin configuración" de "se guardó el mismo
+    # valor que ya estaba".
+    "client_flags": [ClientFlag.FOUND_ROWS],
 }
 
 # Valores por defecto de configuración para un usuario recién creado.

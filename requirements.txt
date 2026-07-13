@@ -2,3 +2,5 @@ bcrypt
 mysql-connector-python
 numpy
 scapy
+scipy
+customtkinter
