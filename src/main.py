@@ -15,8 +15,29 @@ reales. Este orquestador:
     3. Reconstruye cada trama con Scapy y reutiliza los     (parser_csi)
        extractores internos del parser offline
     4. Acumula los vectores de amplitud en una ventana       (signal_filter)
-       deslizante y dispara el pipeline de DSP + persistencia
-       cada vez que la ventana se llena
+       deslizante, mide la fs REAL de cada ventana a partir
+       de los timestamps del propio stream pcap, y dispara
+       el pipeline de DSP + persistencia con esa fs (no una
+       fs fija asumida de antemano)
+    5. Publica telemetría en vivo (varianza, fs real, umbral)  (UDP)
+       para que el Dashboard la muestre sin tener que tocar MySQL
+    6. Relee el umbral de sensibilidad cada cierta cantidad de   (hilo aparte)
+       ventanas procesadas, para enterarse si el usuario lo
+       cambió desde el Dashboard mientras el sistema corre
+
+Corrección de bug (fs real vs. fs asumida):
+    En la primera versión en vivo, el filtro Butterworth asumía una fs
+    fija de 100 Hz. La Raspberry Pi real entrega paquetes CSI a una tasa
+    mucho más alta y VARIABLE (~660-690 Hz medidos en pruebas sucesivas,
+    según condiciones de captura). Diseñar el pasabanda con una Nyquist
+    equivocada dejaba pasar prácticamente todo el ruido de alta
+    frecuencia, disparando la varianza a valores absurdos (>80.000) y
+    dejando el trigger de movimiento trabado en `True` para siempre (por
+    eso nunca se volvía a registrar un evento nuevo, aunque hubiera
+    movimiento real). La solución no es hardcodear 650 Hz -algo que
+    volvería a romperse apenas la tasa real cambiara de nuevo-, sino
+    medir la fs de CADA ventana a partir de sus propios timestamps y
+    pasársela a `DetectorMovimiento.procesar_ventana()` en cada llamada.
 
 Cómo llega el stream:
     La Raspberry Pi corre `tcpdump` en modo escritura-a-stdout ("-w -")
@@ -44,6 +65,8 @@ import logging
 import socket
 import struct
 import sys
+import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Deque, Optional, Tuple
@@ -70,6 +93,7 @@ from src.database.database import obtener_configuracion_usuario, verificar_usuar
 # convendría promoverlas a funciones públicas de un módulo común.
 from src.parser.parser_csi import _calcular_amplitud_fase, _extraer_payload_csi
 from src.processing.signal_filter import DetectorMovimiento, FRECUENCIA_MUESTREO_DEFAULT_HZ
+from src.common.telemetria_ipc import HOST_TELEMETRIA, PUERTO_TELEMETRIA, serializar_muestra
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -117,8 +141,57 @@ MAGIC_NUMBER_NS = 0xA1B23C4D  # timestamps con resolución de nanosegundos
 # ---------------------------------------------------------------------------
 # Constantes de la ventana deslizante
 # ---------------------------------------------------------------------------
-TAMANO_VENTANA = 200       # paquetes por ventana de análisis DSP
-PASO_DESLIZAMIENTO = 20    # paquetes viejos que se descartan tras cada análisis
+# IMPORTANTE: la ventana se define por TIEMPO REAL transcurrido, no por
+# una cantidad fija de paquetes. En pruebas sucesivas la tasa real de
+# paquetes CSI varió de ~5.7 Hz (tráfico Wi-Fi ambiente, sin estímulo)
+# a ~690 Hz (con tráfico activo) — dos órdenes de magnitud de
+# diferencia. Una cantidad fija de paquetes (por ejemplo, 1300) sólo
+# representa "2 segundos reales" si la tasa se mantiene cerca de 650Hz;
+# a 5.7Hz, juntar 1300 paquetes tarda más de 3 minutos. Por eso la
+# ventana se arma acumulando paquetes hasta que el lapso entre el
+# primero y el último (medido con sus propios timestamps del pcap)
+# alcanza DURACION_VENTANA_SEG, sin importar cuántos paquetes hicieron
+# falta para llegar ahí.
+DURACION_VENTANA_SEG = 2.0        # duración real de cada ventana de análisis DSP
+PASO_DESLIZAMIENTO_SEG = 0.2      # avance real entre ventanas sucesivas
+
+# Techo de seguridad de memoria: por más que la tasa real sea rarísima
+# (timestamps corridos, reloj de la RPi desincronizado, etc.), el
+# buffer nunca debe crecer sin límite. A cualquier tasa realista este
+# techo es muchísimo más grande de lo que hace falta.
+MAX_PAQUETES_BUFFER_SEGURIDAD = 50_000
+
+# Si pasan más de este tiempo sin completar una ventana, se informa en
+# el log cuántos paquetes se acumularon hasta ahora (a lo sumo una vez
+# cada tantos segundos, para no inundar la consola). Esto es
+# específicamente para que una tasa de paquetes muy baja (tráfico Wi-Fi
+# escaso) sea visible en el momento, y no un silencio que parezca que
+# el sistema se colgó.
+INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG = 5.0
+
+# ---------------------------------------------------------------------------
+# Constantes de la relectura periódica de configuración
+# ---------------------------------------------------------------------------
+# Con paso de deslizamiento de 0.2s, se procesa una ventana nueva
+# aproximadamente cada 200ms (~5 ventanas/seg) siempre que haya
+# suficiente tráfico como para completar la ventana — esta cadencia SÍ
+# es estable en tiempo real independientemente de la tasa de paquetes
+# (a diferencia de la versión anterior, basada en cantidad de
+# ventanas). Releer MySQL en CADA ventana seguiría siendo un
+# desperdicio (y un riesgo: cualquier consulta corre en el hilo que
+# también lee el socket TCP de la Raspberry Pi). En cambio, se cuenta
+# la cantidad de ventanas procesadas y, cada
+# BLOQUES_ENTRE_RELECTURAS_CONFIG ventanas, se le pide a un hilo de
+# background -separado del hilo caliente- que vuelva a consultar
+# `configuracion_sistema`.
+BLOQUES_ENTRE_RELECTURAS_CONFIG = 25  # ≈ cada 5 segundos a ~5 ventanas/seg
+
+# Techo de seguridad: aunque no se junten BLOQUES_ENTRE_RELECTURAS_CONFIG
+# ventanas (por ejemplo, si el stream está inactivo o la tasa de
+# paquetes es muy baja), el hilo de relectura igual revisa la
+# configuración cada tanto.
+TIMEOUT_ESPERA_RELECTURA_SEG = 10.0
+
 
 
 class ErrorProtocoloPcap(Exception):
@@ -158,6 +231,78 @@ def cargar_configuracion(usuario_id: int) -> Optional[dict]:
         f"canal_wifi={config['canal_wifi']}, bssid_objetivo={config['bssid_objetivo']}"
     )
     return config
+
+
+def _hilo_relectura_configuracion(
+    usuario_id: int,
+    detector: DetectorMovimiento,
+    evento_relectura: threading.Event,
+    detener_evento: threading.Event,
+) -> None:
+    """
+    Hilo de background dedicado exclusivamente a releer
+    `configuracion_sistema` cada vez que el hilo caliente (el que lee el
+    socket TCP de la Raspberry Pi) le avisa que pasaron
+    `BLOQUES_ENTRE_RELECTURAS_CONFIG` ventanas procesadas —o, como
+    máximo, cada `TIMEOUT_ESPERA_RELECTURA_SEG` segundos, como red de
+    seguridad si el stream está inactivo.
+
+    Corre en su propio hilo a propósito: si esta consulta a MySQL
+    tardara (lock contention, red lenta, lo que sea), NUNCA debe
+    frenar la lectura de paquetes CSI en vivo. Actualiza
+    `detector.umbral_sensibilidad` directamente; una simple
+    reasignación de atributo es atómica a nivel de bytecode en
+    CPython, así que no hace falta ningún Lock para esto.
+    """
+    while not detener_evento.is_set():
+        disparado_por_bloques = evento_relectura.wait(timeout=TIMEOUT_ESPERA_RELECTURA_SEG)
+        if detener_evento.is_set():
+            break
+        if disparado_por_bloques:
+            evento_relectura.clear()
+
+        config = obtener_configuracion_usuario(usuario_id)
+        if config is None:
+            logger.warning(
+                "Relectura de configuración: no se pudo consultar la BD "
+                "(se reintenta en el próximo ciclo)."
+            )
+            continue
+
+        nuevo_umbral = config["umbral_sensibilidad"]
+        if nuevo_umbral != detector.umbral_sensibilidad:
+            logger.info(
+                f"Umbral de sensibilidad actualizado desde el Dashboard: "
+                f"{detector.umbral_sensibilidad} -> {nuevo_umbral}"
+            )
+            detector.umbral_sensibilidad = nuevo_umbral
+
+
+def _enviar_telemetria(
+    sock_telemetria: socket.socket,
+    resultado: dict,
+    fs_estimada: Optional[float],
+    umbral_actual: float,
+) -> None:
+    """
+    Publica la muestra de telemetría de esta ventana hacia el Dashboard
+    por UDP (ver `src/common/telemetria_ipc.py` para el porqué de esta
+    elección). Es estrictamente "fire and forget": si falla —por
+    ejemplo, porque el Dashboard no está corriendo y nadie escucha en
+    ese puerto—, se descarta en silencio (a nivel DEBUG) sin afectar en
+    absoluto al hilo que lee paquetes CSI en vivo.
+    """
+    payload = serializar_muestra(
+        varianza_promedio=resultado["varianza_promedio"],
+        fs_estimada=fs_estimada,
+        umbral_actual=umbral_actual,
+        movimiento_detectado=resultado["movimiento_detectado"],
+        timestamp=time.time(),
+    )
+    try:
+        sock_telemetria.send(payload)
+    except OSError as e:
+        logger.debug(f"No se pudo enviar telemetría UDP (se ignora, no es crítico): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +444,19 @@ def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 # Paso 4: Ventana deslizante + disparo del pipeline de DSP
 # ---------------------------------------------------------------------------
-def _procesar_stream(conexion: socket.socket, detector: DetectorMovimiento) -> None:
+def _procesar_stream(
+    conexion: socket.socket,
+    detector: DetectorMovimiento,
+    sock_telemetria: socket.socket,
+    evento_relectura: threading.Event,
+) -> None:
     """
     Consume el stream pcap de una conexión ya aceptada: lee la cabecera
     global, y después entra en un loop que arma la ventana deslizante de
-    amplitudes y dispara `detector.procesar_ventana()` cada vez que se
-    junta un bloque completo de `TAMANO_VENTANA` paquetes CSI válidos.
+    amplitudes y dispara `detector.procesar_ventana()` cada vez que el
+    lapso entre el primer y el último paquete acumulado alcanza
+    `DURACION_VENTANA_SEG` segundos reales (sin importar cuántos
+    paquetes hicieron falta para llegar ahí).
 
     Vuelve (return) apenas la conexión se cierra o se detecta un
     problema irrecuperable, dejando que `_ejecutar_servidor` acepte una
@@ -323,13 +475,17 @@ def _procesar_stream(conexion: socket.socket, detector: DetectorMovimiento) -> N
     )
 
     # Cada elemento del buffer es (vector_amplitud, timestamp_del_paquete).
-    # El timestamp se usa sólo para estimar la frecuencia de muestreo real
-    # de esta ventana (ver más abajo) y comparala con la que asume el filtro.
-    buffer_ventana: Deque[Tuple[np.ndarray, float]] = deque(maxlen=TAMANO_VENTANA)
+    # Sin maxlen "chico": el tamaño real de la ventana lo decide el
+    # tiempo transcurrido, no una cantidad fija. MAX_PAQUETES_BUFFER_SEGURIDAD
+    # es sólo un techo de emergencia por si los timestamps vinieran
+    # corridos y la ventana nunca "cerrara" por tiempo.
+    buffer_ventana: Deque[Tuple[np.ndarray, float]] = deque(maxlen=MAX_PAQUETES_BUFFER_SEGURIDAD)
 
     n_subportadoras_esperado: Optional[int] = None
     n_paquetes_csi = 0
     n_paquetes_descartados = 0
+    n_ventanas_desde_ultima_relectura = 0
+    momento_ultimo_aviso_lento: Optional[float] = None
 
     while True:
         try:
@@ -365,29 +521,72 @@ def _procesar_stream(conexion: socket.socket, detector: DetectorMovimiento) -> N
         n_paquetes_csi += 1
         buffer_ventana.append((vector_amplitud, timestamp_paquete))
 
-        if len(buffer_ventana) == TAMANO_VENTANA:
-            _procesar_ventana_completa(buffer_ventana, detector, n_paquetes_csi, n_paquetes_descartados)
+        duracion_acumulada = buffer_ventana[-1][1] - buffer_ventana[0][1]
 
-            # Ventana deslizante: se descartan los PASO_DESLIZAMIENTO
-            # paquetes más viejos en vez de esperar a juntar 200 paquetes
-            # nuevos de cero. Así la ventana avanza de a saltos chicos
-            # (más resolución temporal) sin tener que correr el filtro
-            # Butterworth en CADA paquete que llega (carísimo en tiempo real).
-            for _ in range(PASO_DESLIZAMIENTO):
-                buffer_ventana.popleft()
+        if duracion_acumulada < DURACION_VENTANA_SEG:
+            # Todavía no hay suficiente tiempo real acumulado. Se avisa
+            # cada tanto (no en cada paquete) para que una tasa de
+            # paquetes muy baja sea visible en el log, en vez de un
+            # silencio que parezca que el sistema se colgó (como pasó
+            # con los ~5.7 paquetes/seg de tráfico ambiente).
+            ahora = time.time()
+            if (
+                momento_ultimo_aviso_lento is None
+                or (ahora - momento_ultimo_aviso_lento) >= INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG
+            ):
+                logger.info(
+                    f"Acumulando paquetes para completar una ventana de "
+                    f"{DURACION_VENTANA_SEG:.1f}s reales: llevamos "
+                    f"{len(buffer_ventana)} paquetes CSI válidos "
+                    f"({duracion_acumulada:.2f}s de datos reales). Si esto tarda "
+                    f"mucho, la tasa real de paquetes puede ser muy baja "
+                    f"(poco tráfico Wi-Fi en el canal) — considerá generar "
+                    f"tráfico activo hacia el AP objetivo (por ejemplo, un ping "
+                    f"seguido) para sostener una tasa más alta."
+                )
+                momento_ultimo_aviso_lento = ahora
+            continue
+
+        # Ventana completa (por tiempo real, no por cantidad de paquetes).
+        _procesar_ventana_completa(
+            buffer_ventana, detector, sock_telemetria, n_paquetes_csi, n_paquetes_descartados
+        )
+        momento_ultimo_aviso_lento = None
+
+        # Cada BLOQUES_ENTRE_RELECTURAS_CONFIG ventanas, se le avisa al
+        # hilo de relectura que vuelva a consultar la BD. `Event.set()`
+        # es una operación O(1) que jamás bloquea: la consulta a MySQL
+        # en sí ocurre enteramente en el otro hilo.
+        n_ventanas_desde_ultima_relectura += 1
+        if n_ventanas_desde_ultima_relectura >= BLOQUES_ENTRE_RELECTURAS_CONFIG:
+            n_ventanas_desde_ultima_relectura = 0
+            evento_relectura.set()
+
+        # Ventana deslizante POR TIEMPO: se descartan los paquetes más
+        # viejos hasta que la ventana restante mida aproximadamente
+        # (DURACION_VENTANA_SEG - PASO_DESLIZAMIENTO_SEG) segundos, en
+        # vez de descartar una cantidad fija de paquetes. Así el avance
+        # de la ventana es consistente en tiempo real sin importar
+        # cuántos paquetes por segundo estén llegando en este momento.
+        limite_tiempo = buffer_ventana[-1][1] - (DURACION_VENTANA_SEG - PASO_DESLIZAMIENTO_SEG)
+        while len(buffer_ventana) > 1 and buffer_ventana[0][1] < limite_tiempo:
+            buffer_ventana.popleft()
 
 
 def _procesar_ventana_completa(
     buffer_ventana: Deque[Tuple[np.ndarray, float]],
     detector: DetectorMovimiento,
+    sock_telemetria: socket.socket,
     n_paquetes_csi: int,
     n_paquetes_descartados: int,
 ) -> None:
     """
-    Convierte el buffer circular actual en una matriz de NumPy y la
-    envía al motor de DSP (`DetectorMovimiento`), que se encarga de
-    filtrar, calcular la varianza, evaluar el trigger, y persistir el
-    evento en MySQL si corresponde.
+    Convierte el buffer circular actual en una matriz de NumPy, mide la
+    fs real de la ventana a partir de los timestamps del propio stream
+    pcap, y se la pasa al motor de DSP (`DetectorMovimiento`), que
+    recalcula el filtro Butterworth con esa fs, calcula la varianza,
+    evalúa el trigger, y persiste el evento en MySQL si corresponde.
+    Publica además la telemetría de esta ventana por UDP.
     """
     vectores = [item[0] for item in buffer_ventana]
     timestamps = [item[1] for item in buffer_ventana]
@@ -399,35 +598,28 @@ def _procesar_ventana_completa(
         (len(timestamps) - 1) / duracion_ventana_seg if duracion_ventana_seg > 0 else None
     )
 
-    resultado = detector.procesar_ventana(matriz_ventana)
+    # Se pasa fs_estimada directamente: DetectorMovimiento recalcula los
+    # coeficientes del filtro Butterworth con la fs REAL de esta ventana
+    # en vez de asumir un valor fijo. Esta es la corrección al bug de
+    # producción (fs real ~650-690Hz vs. 100Hz asumidos originalmente),
+    # que hacía que la varianza se disparara a >80.000 y el trigger
+    # quedara trabado en True para siempre. Si por algún motivo no se
+    # pudo estimar fs (ventana con timestamps degenerados), se pasa
+    # None y DetectorMovimiento cae a su fs de fallback.
+    resultado = detector.procesar_ventana(matriz_ventana, frecuencia_muestreo=fs_estimada)
 
     estado_legible = "MOVIMIENTO" if resultado["movimiento_detectado"] else "reposo"
-    mensaje_fs = (
-        f"fs_real≈{fs_estimada:.1f}Hz (asumida={FRECUENCIA_MUESTREO_DEFAULT_HZ}Hz)"
-        if fs_estimada is not None
-        else "fs_real=N/D"
-    )
+    texto_fs = f"{fs_estimada:.1f}Hz" if fs_estimada is not None else "N/D"
     logger.info(
         f"[Ventana procesada] estado={estado_legible} | "
         f"varianza={resultado['varianza_promedio']:.4f} | "
+        f"umbral={detector.umbral_sensibilidad:.2f} | "
         f"evento_nuevo_en_BD={resultado['evento_registrado']} | "
-        f"{mensaje_fs} | "
+        f"fs_real={texto_fs} | "
         f"paquetes_csi_totales={n_paquetes_csi} | descartados={n_paquetes_descartados}"
     )
 
-    # Si la fs real se aleja mucho de la asumida por el filtro, el
-    # pasabanda de signal_filter.py estaría mirando una banda de
-    # frecuencia distinta a la que corresponde. Se avisa para que se
-    # pueda ajustar FRECUENCIA_MUESTREO_DEFAULT_HZ en signal_filter.py.
-    if fs_estimada is not None and abs(fs_estimada - FRECUENCIA_MUESTREO_DEFAULT_HZ) > (
-        0.25 * FRECUENCIA_MUESTREO_DEFAULT_HZ
-    ):
-        logger.warning(
-            f"La frecuencia de muestreo real (~{fs_estimada:.1f} Hz) difiere "
-            f"más de un 25% de la asumida en el filtro "
-            f"({FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz). Conviene actualizar "
-            f"FRECUENCIA_MUESTREO_DEFAULT_HZ en signal_filter.py."
-        )
+    _enviar_telemetria(sock_telemetria, resultado, fs_estimada, detector.umbral_sensibilidad)
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +664,11 @@ def _imprimir_instrucciones_raspberry_pi() -> None:
     print("=" * 72 + "\n")
 
 
-def _ejecutar_servidor(detector: DetectorMovimiento) -> None:
+def _ejecutar_servidor(
+    detector: DetectorMovimiento,
+    sock_telemetria: socket.socket,
+    evento_relectura: threading.Event,
+) -> None:
     """
     Levanta el servidor TCP y acepta conexiones en un loop infinito: si
     la Raspberry Pi se desconecta (Wi-Fi caído, tcpdump reiniciado,
@@ -494,7 +690,7 @@ def _ejecutar_servidor(detector: DetectorMovimiento) -> None:
             logger.info(f"Raspberry Pi conectada desde {direccion[0]}:{direccion[1]}.")
 
             try:
-                _procesar_stream(conexion, detector)
+                _procesar_stream(conexion, detector, sock_telemetria, evento_relectura)
             except (socket.timeout, TimeoutError):
                 logger.warning(
                     f"No llegaron datos en {TIMEOUT_INACTIVIDAD_SEG:.0f}s: se asume que "
@@ -531,16 +727,38 @@ def main() -> None:
     )
     logger.info(
         f"DetectorMovimiento inicializado con umbral_sensibilidad="
-        f"{config['umbral_sensibilidad']} y fs={FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz."
+        f"{config['umbral_sensibilidad']} (fs de fallback={FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz; "
+        f"en vivo se va a usar la fs REAL medida en cada ventana)."
     )
 
+    # Socket UDP de telemetría hacia el Dashboard. connect() sobre UDP no
+    # hace ningún handshake: sólo fija el destino por defecto para poder
+    # usar send() en vez de sendto() en el resto del código.
+    sock_telemetria = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_telemetria.connect((HOST_TELEMETRIA, PUERTO_TELEMETRIA))
+    logger.info(f"Telemetría UDP configurada hacia {HOST_TELEMETRIA}:{PUERTO_TELEMETRIA}.")
+
+    # Hilo de background para la relectura periódica de umbral_sensibilidad.
+    evento_relectura = threading.Event()
+    detener_relectura = threading.Event()
+    hilo_relectura = threading.Thread(
+        target=_hilo_relectura_configuracion,
+        args=(usuario_id, detector, evento_relectura, detener_relectura),
+        daemon=True,
+        name="relectura-configuracion",
+    )
+    hilo_relectura.start()
+
     try:
-        _ejecutar_servidor(detector)
+        _ejecutar_servidor(detector, sock_telemetria, evento_relectura)
     except KeyboardInterrupt:
         logger.info("Servidor detenido manualmente (Ctrl+C). Cerrando.")
     except OSError as e:
         logger.error(f"No se pudo levantar el servidor TCP en {HOST}:{PORT}: {e}")
         sys.exit(1)
+    finally:
+        detener_relectura.set()
+        sock_telemetria.close()
 
 
 if __name__ == "__main__":

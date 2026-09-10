@@ -35,10 +35,10 @@ Autor: Trabajo Integrador Final - Módulo de Procesamiento de Señal (MVP 2)
 """
 
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, sosfiltfilt
 
 # ---------------------------------------------------------------------------
 # Import robusto de la capa de persistencia
@@ -72,11 +72,27 @@ logger = logging.getLogger("signal_filter")
 # Constantes del pipeline de procesamiento
 # ---------------------------------------------------------------------------
 
-# Frecuencia de muestreo (paquetes CSI por segundo) por defecto. Es un
-# valor de referencia común en trabajos de Wi-Fi sensing con Nexmon CSI,
-# pero DEPENDE de la tasa de inyección/captura configurada en la
-# Raspberry Pi. Ajustar según la configuración real del MVP 1.
-FRECUENCIA_MUESTREO_DEFAULT_HZ = 100.0
+# Frecuencia de muestreo (paquetes CSI por segundo) de FALLBACK.
+#
+# Historial: originalmente este valor estaba en 100 Hz (una referencia
+# genérica de trabajos de Wi-Fi sensing), pero la medición en vivo con
+# la Raspberry Pi real mostró una tasa efectiva de ~650-690 Hz. Ese
+# desfasaje hacía que el filtro Butterworth diseñara su banda de paso
+# sobre una frecuencia de Nyquist equivocada (50 Hz asumidos vs. ~325 Hz
+# reales), dejando pasar prácticamente todo el ruido de alta frecuencia
+# sin atenuar y disparando la varianza a valores absurdos (>80.000),
+# lo que a su vez dejaba el trigger trabado en `True` para siempre.
+#
+# La solución de fondo NO es hardcodear 650 Hz: las dos mediciones en
+# vivo ya dieron valores distintos (686.0 Hz y 659.9 Hz), señal de que
+# la tasa real fluctúa según las condiciones de captura. Por eso
+# `DetectorMovimiento.procesar_ventana()` ahora recibe la `fs` REAL de
+# cada ventana (medida por `src/main.py` a partir de los timestamps del
+# propio stream pcap) y la usa para recalcular los coeficientes del
+# filtro en cada llamada. Este valor de acá queda como red de
+# seguridad, únicamente para los casos en que no hay timestamps reales
+# disponibles (por ejemplo, el bloque de demostración de este archivo).
+FRECUENCIA_MUESTREO_DEFAULT_HZ = 650.0
 
 # Banda de paso del filtro Butterworth: frecuencias típicas de
 # movimiento humano (caminar, gesticular) en sensado Wi-Fi CSI. Por
@@ -150,18 +166,52 @@ def filtrar_señal_butterworth(
         )
         freq_corte_alta = freq_corte_alta_ajustada
 
+    # Guarda de seguridad: el ajuste de arriba sólo corrige el borde
+    # SUPERIOR de la banda contra Nyquist. Si la fs real es tan baja que
+    # ni siquiera el borde INFERIOR (freq_corte_baja) entra por debajo
+    # del superior ya ajustado, la banda de paso queda vacía o invertida
+    # y scipy.signal.butter() lanza "Wn[0] must be less than Wn[1]" —
+    # esto se pudo reproducir en vivo con tráfico Wi-Fi muy escaso
+    # (fs real de menos de 1 Hz, perfectamente posible con la ventana
+    # por tiempo si hay huecos grandes entre paquetes). En ese caso no
+    # hay ningún pasabanda válido que diseñar -haría falta muestrear más
+    # rápido para distinguir la banda de interés-, así que se devuelve
+    # la señal sin filtrar en vez de crashear todo el pipeline en vivo.
+    if freq_corte_baja >= freq_corte_alta:
+        logger.warning(
+            f"La fs de esta ventana ({frecuencia_muestreo:.3f} Hz, Nyquist="
+            f"{nyquist:.3f} Hz) es demasiado baja para el pasabanda "
+            f"configurado ({FRECUENCIA_CORTE_BAJA_HZ}-{FRECUENCIA_CORTE_ALTA_HZ} Hz). "
+            f"Se devuelve la señal sin filtrar."
+        )
+        return matriz_amplitud
+
     baja_normalizada = freq_corte_baja / nyquist
     alta_normalizada = freq_corte_alta / nyquist
 
-    b, a = butter(orden, [baja_normalizada, alta_normalizada], btype="bandpass")
+    # IMPORTANTE: se pide la representación en Second-Order Sections
+    # (SOS) en lugar de los coeficientes de función de transferencia
+    # (b, a). Para un pasabanda de banda MUY angosta como este (0.5-2.5
+    # Hz sobre una Nyquist de cientos de Hz a fs reales ~650Hz, es decir
+    # frecuencias normalizadas del orden de 0.0015-0.0077), la forma
+    # (b, a) es numéricamente inestable: los errores de redondeo al
+    # expandir el polinomio empujan algunos polos fuera del círculo
+    # unitario (se verificó con scipy.signal.tf2zpk: 3 de 8 polos con
+    # radio > 1.0 en este caso concreto). Con ventanas cortas eso no se
+    # nota, pero con ventanas largas (1300 muestras = 2s reales) el
+    # filtro tiene tiempo de sobra para divergir exponencialmente,
+    # disparando la varianza a valores absurdos (billones) incluso en
+    # reposo. La cascada de secciones de segundo orden (SOS) es la
+    # forma estándar de la industria para evitar este problema.
+    sos = butter(orden, [baja_normalizada, alta_normalizada], btype="bandpass", output="sos")
 
     try:
         # axis=0 -> filtra a lo largo del tiempo, columna por columna
         # (subportadora por subportadora), en una única operación vectorizada.
-        matriz_filtrada = filtfilt(b, a, matriz_amplitud, axis=0)
+        matriz_filtrada = sosfiltfilt(sos, matriz_amplitud, axis=0)
     except ValueError as e:
-        # filtfilt exige un mínimo de muestras (relacionado con el orden
-        # del filtro) para poder aplicar su padding interno. Si la
+        # sosfiltfilt exige un mínimo de muestras (relacionado con el
+        # orden del filtro) para poder aplicar su padding interno. Si la
         # ventana es demasiado corta, se prefiere degradar de forma
         # controlada antes que romper el pipeline completo.
         logger.warning(
@@ -280,7 +330,9 @@ class DetectorMovimiento:
         # se asume que el sistema inicia en reposo.
         self._estado_anterior: bool = False
 
-    def procesar_ventana(self, matriz_amplitud: np.ndarray) -> dict:
+    def procesar_ventana(
+        self, matriz_amplitud: np.ndarray, frecuencia_muestreo: Optional[float] = None
+    ) -> dict:
         """
         Ejecuta el pipeline completo sobre una ventana de amplitudes CSI
         y, si corresponde, registra el evento en la base de datos.
@@ -288,6 +340,17 @@ class DetectorMovimiento:
         Args:
             matriz_amplitud: matriz (n_paquetes, n_subportadoras) de
                 amplitudes CSI crudas de la ventana actual.
+            frecuencia_muestreo: fs REAL de esta ventana en particular,
+                medida por el llamador a partir de timestamps reales
+                (por ejemplo, `src/main.py` la calcula a partir de los
+                timestamps del stream pcap en vivo). Si se provee, tiene
+                prioridad sobre la fs fija con la que se construyó este
+                detector — es la forma correcta de operar en producción,
+                donde la tasa real de llegada de paquetes puede fluctuar
+                (carga de red, jitter de hardware, tráfico ambiente) y
+                no hay ninguna garantía de que coincida con un valor
+                asumido de antemano. Si se omite, se usa
+                `self.frecuencia_muestreo` como antes.
 
         Returns:
             dict con:
@@ -296,10 +359,17 @@ class DetectorMovimiento:
                 - "evento_registrado" (bool): True si esta ventana
                   disparó un flanco ascendente y el evento se persistió
                   correctamente en la base de datos.
+                - "frecuencia_muestreo_usada" (float): la fs que
+                  efectivamente se usó para diseñar el filtro en esta
+                  llamada (útil para logging/telemetría).
         """
+        fs_efectiva = (
+            frecuencia_muestreo if frecuencia_muestreo is not None else self.frecuencia_muestreo
+        )
+
         matriz_filtrada = filtrar_señal_butterworth(
             matriz_amplitud,
-            frecuencia_muestreo=self.frecuencia_muestreo,
+            frecuencia_muestreo=fs_efectiva,
             freq_corte_baja=self.freq_corte_baja,
             freq_corte_alta=self.freq_corte_alta,
             orden=self.orden_filtro,
@@ -316,7 +386,9 @@ class DetectorMovimiento:
         # nuevo evento, para no duplicar el mismo evento continuo en
         # cada ventana sucesiva mientras el movimiento se mantiene.
         if movimiento_detectado and not self._estado_anterior:
-            duracion_estimada = self._estimar_duracion_segundos(matriz_amplitud.shape[0])
+            duracion_estimada = self._estimar_duracion_segundos(
+                matriz_amplitud.shape[0], frecuencia_muestreo=fs_efectiva
+            )
             evento_id = insertar_evento_movimiento(
                 usuario_id=self.usuario_id,
                 varianza=varianza_promedio,
@@ -342,22 +414,34 @@ class DetectorMovimiento:
             "movimiento_detectado": movimiento_detectado,
             "varianza_promedio": varianza_promedio,
             "evento_registrado": evento_registrado,
+            "frecuencia_muestreo_usada": fs_efectiva,
         }
 
-    def _estimar_duracion_segundos(self, n_paquetes: int) -> int:
+    def _estimar_duracion_segundos(
+        self, n_paquetes: int, frecuencia_muestreo: Optional[float] = None
+    ) -> int:
         """
         Estima la duración del evento como la duración temporal de la
-        ventana de paquetes analizada (n_paquetes / frecuencia_muestreo).
+        ventana de paquetes analizada (n_paquetes / fs).
 
         Es una aproximación deliberadamente simple para el MVP: se
         registra la duración de la ventana en la que se detectó el
         inicio del movimiento. Una futura iteración podría, en cambio,
         acumular la duración real hasta detectar el flanco descendente
         (fin del movimiento) antes de persistir el evento.
+
+        Args:
+            n_paquetes: cantidad de paquetes en la ventana.
+            frecuencia_muestreo: fs a usar para el cálculo; si se omite,
+                se usa `self.frecuencia_muestreo`. Debe ser la misma fs
+                efectiva con la que se filtró la ventana, para que la
+                duración persistida sea consistente con el filtro
+                aplicado.
         """
-        if self.frecuencia_muestreo <= 0 or n_paquetes <= 0:
+        fs = frecuencia_muestreo if frecuencia_muestreo is not None else self.frecuencia_muestreo
+        if fs is None or fs <= 0 or n_paquetes <= 0:
             return 0
-        return max(1, round(n_paquetes / self.frecuencia_muestreo))
+        return max(1, round(n_paquetes / fs))
 
     def reiniciar_estado(self) -> None:
         """Reinicia el estado del trigger a reposo (False)."""
