@@ -1,47 +1,7 @@
-"""
-dashboard.py
-============
+"""Interfaz gráfica (CustomTkinter): login, monitoreo, configuración, historial y telemetría.
 
-Interfaz gráfica de usuario (MVP 3) del Sistema de Detección Pasiva de
-Movimiento por CSI Wi-Fi. Construida con `customtkinter` sobre la capa
-de persistencia ya existente (`src.database.database`), sin acceder a
-MySQL directamente: todo pasa por las mismas funciones que ya usan
-`src/main.py` y el resto del pipeline.
-
-Pantallas:
-    1. Login: valida credenciales contra `verificar_usuario`.
-    2. Panel principal, con tres secciones (CTkTabview):
-        - Monitoreo: tarjeta grande de estado del canal, que se
-          refresca sola cada pocos segundos consultando
-          la telemetría en vivo y `obtener_ultimo_evento`: alerta mientras
-          haya un movimiento en curso y durante unos segundos después de
-          que termina, e indica si el sensor dejó de enviar datos.
-        - Configuración: muestra los parámetros actuales del usuario
-          (`obtener_configuracion_usuario`), permite ajustar el umbral
-          de sensibilidad con un slider y activar o desactivar el
-          guardado de eventos en el historial, persistiendo el cambio con
-          `actualizar_configuracion_usuario`.
-        - Telemetría Live: recibe, por UDP local (ver
-          `src/common/telemetria_ipc.py`), la varianza, la fs real y el
-          estado del filtro que `src/main.py` mide en CADA ventana
-          procesada, y las grafica en vivo. Las ventanas que NO pasaron
-          por el pasabanda SOS (fs insuficiente o pocas muestras) se
-          dibujan en gris y se informan explícitamente, para que una
-          varianza cruda enorme no se confunda con movimiento real.
-
-Concurrencia:
-    Tkinter (y por lo tanto customtkinter) no es thread-safe: ningún
-    widget puede tocarse desde un hilo que no sea el principal (el que
-    corre `mainloop()`). Tanto las consultas a MySQL como la recepción
-    de telemetría UDP corren en su propio `threading.Thread` de
-    background; esos hilos NUNCA actualizan widgets directamente, sino
-    que agendan la actualización de vuelta en el hilo principal con
-    `self.after(0, callback, ...)`.
-
-Requisitos:
-    pip install customtkinter
-
-Autor: Trabajo Integrador Final - Módulo de Interfaz Gráfica (MVP 3)
+Las consultas a la base y la recepción UDP corren en hilos aparte; los widgets
+se actualizan siempre desde el hilo principal con self.after().
 """
 
 import logging
@@ -51,15 +11,12 @@ import sys
 import threading
 import tkinter as tk
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Deque, Optional, Tuple
 
 import customtkinter as ctk
 
-# ---------------------------------------------------------------------------
-# Resolución de rutas / imports
-# ---------------------------------------------------------------------------
 RAIZ_PROYECTO = Path(__file__).resolve().parents[2]
 if str(RAIZ_PROYECTO) not in sys.path:
     sys.path.insert(0, str(RAIZ_PROYECTO))
@@ -67,81 +24,68 @@ if str(RAIZ_PROYECTO) not in sys.path:
 from src.database.database import (
     actualizar_configuracion_usuario,
     obtener_configuracion_usuario,
+    contar_eventos_usuario,
+    obtener_estadisticas_periodo,
+    obtener_historico_usuario,
+    obtener_resumen_diario,
     obtener_ultimo_evento,
     verificar_usuario,
 )
 from src.common.telemetria_ipc import HOST_TELEMETRIA, PUERTO_TELEMETRIA, deserializar_muestra
 from src.processing.signal_filter import DESCRIPCION_ESTADO_FILTRO, ESTADO_FILTRO_SOS_OK
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("dashboard")
 
-# ---------------------------------------------------------------------------
-# Constantes de la interfaz
-# ---------------------------------------------------------------------------
 
-# Cada cuánto se refresca automáticamente el panel de monitoreo (ms).
 INTERVALO_ACTUALIZACION_MS = 3000
 
-# La alerta roja se mantiene mientras el movimiento esté EN CURSO y, una vez
-# terminado, durante esta cantidad de segundos contados desde su FIN.
 VENTANA_ALERTA_SEGUNDOS = 10
 
-# Si no llega telemetría de main.py en este tiempo, la tarjeta de Monitoreo
-# informa "Sensor sin datos" en lugar de "Entorno seguro".
 SEGUNDOS_SIN_TELEMETRIA_OFFLINE = 5
 
-# Al terminar un movimiento, se consulta la base tras esta demora (para dar
-# tiempo a que el hilo de registro de main.py cierre el evento).
 DEMORA_CONSULTA_FIN_EVENTO_MS = 700
 
-# Rango del slider de umbral de sensibilidad, en ESCALA LOGARÍTMICA.
-#
-# El rango original (0-10) se había definido antes de conocer la escala
-# real de la varianza filtrada. Desde que signal_filter.py normaliza cada
-# paquete (amplitud en % de su media), la varianza queda en %^2: del
-# orden de décimas en reposo y de unidades a decenas con movimiento, y
-# su valor exacto depende de la distancia entre equipos y del entorno.
-# Una escala logarítmica (0.01 a 10.000) cubre seis órdenes de magnitud
-# con la misma resolución RELATIVA en todo el rango (cada paso del
-# slider mueve el umbral ~2.3%), en vez de quedar o muy grueso en
-# valores bajos o muy fino en valores altos.
+# Slider en escala logarítmica
 UMBRAL_MIN = 0.01
 UMBRAL_MAX = 10_000.0
 PASOS_SLIDER_UMBRAL = 600
 
-COLOR_ALERTA = "#c0392b"      # rojo
-COLOR_REPOSO = "#27ae60"      # verde
+COLOR_ALERTA = "#c0392b"
+COLOR_REPOSO = "#27ae60"
 COLOR_ERROR = "#e74c3c"
 COLOR_EXITO = "#2ecc71"
-COLOR_ADVERTENCIA = "#e67e22"  # naranja: ventana no filtrada
-COLOR_SIN_FILTRO = "#5d6d7e"   # gris: barra de ventana no filtrada
+COLOR_ADVERTENCIA = "#e67e22"
+COLOR_SIN_FILTRO = "#5d6d7e"
 
-# Cuántas muestras de telemetría se conservan para el gráfico en vivo.
-# A ~5 ventanas/seg (paso de deslizamiento de 0.2s) equivale a unos
-# 30 segundos de historial visible.
 MAX_MUESTRAS_TELEMETRIA = 150
 
 COLOR_FONDO_GRAFICO = "#1a1a1a"
-COLOR_LINEA_UMBRAL = "#f1c40f"  # amarillo, para distinguirse de las barras rojo/verde
-COLOR_LINEA_UMBRAL_SALIDA = "#8e7a1f"  # amarillo apagado: umbral de salida (histéresis)
-COLOR_CANDIDATA = "#e67e22"  # naranja: ventana sobre el umbral aún sin confirmar
+COLOR_LINEA_UMBRAL = "#f1c40f"
+COLOR_LINEA_UMBRAL_SALIDA = "#8e7a1f"
+COLOR_CANDIDATA = "#e67e22"
+
+# Historial
+COLOR_BARRA_HISTORIAL = "#3b8ed0"
+COLOR_GRILLA = "#333333"
+COLOR_TEXTO_EJE = "#9a9a9a"
+COLOR_TEXTO_DATO = "#e6e6e6"
+EVENTOS_POR_PAGINA = 10
+# Período -> cantidad de días (None = sin límite)
+PERIODOS_HISTORIAL = {"Hoy": 1, "7 días": 7, "30 días": 30, "Todo": None}
 
 
 def _umbral_a_posicion_slider(umbral: float) -> float:
-    """Convierte un umbral real a la posición (log10) del slider, recortando al rango."""
+    """Convierte un umbral a la posición (log10) del slider."""
     umbral = min(max(float(umbral), UMBRAL_MIN), UMBRAL_MAX)
     return math.log10(umbral)
 
 
 def _posicion_slider_a_umbral(posicion: float) -> float:
-    """Convierte la posición (log10) del slider al umbral real, redondeado a algo legible."""
+    """Convierte la posición del slider a un umbral redondeado."""
     valor = 10 ** float(posicion)
     if valor >= 100:
         return float(round(valor))
@@ -152,8 +96,21 @@ def _posicion_slider_a_umbral(posicion: float) -> float:
     return round(valor, 3)
 
 
+def _formatear_duracion(segundos: Optional[float]) -> str:
+    """Duración legible: '3.2 s', '4 min 05 s' o '1 h 12 min'."""
+    if segundos is None:
+        return "—"
+    if segundos < 60:
+        return f"{segundos:.1f} s"
+    minutos, seg = divmod(int(round(segundos)), 60)
+    if minutos < 60:
+        return f"{minutos} min {seg:02d} s"
+    horas, minutos = divmod(minutos, 60)
+    return f"{horas} h {minutos:02d} min"
+
+
 def _formatear_umbral(valor: float) -> str:
-    """Formato legible para mostrar el umbral en etiquetas."""
+    """Texto del umbral con decimales según su magnitud."""
     if valor >= 100:
         return f"{valor:.0f}"
     if valor >= 1:
@@ -161,15 +118,8 @@ def _formatear_umbral(valor: float) -> str:
     return f"{valor:.3f}"
 
 
-# ---------------------------------------------------------------------------
-# Pantalla de Login
-# ---------------------------------------------------------------------------
 class FrameLogin(ctk.CTkFrame):
-    """
-    Formulario de inicio de sesión. Valida credenciales contra la base
-    de datos a través de `verificar_usuario`, sin bloquear la interfaz
-    mientras dura la consulta.
-    """
+    """Pantalla de inicio de sesión."""
 
     def __init__(self, master: "DashboardApp", on_login_exitoso):
         super().__init__(master, fg_color="transparent")
@@ -225,7 +175,6 @@ class FrameLogin(ctk.CTkFrame):
         hilo.start()
 
     def _verificar_en_hilo(self, username: str, password: str) -> None:
-        """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
             usuario_id = verificar_usuario(username, password)
         except Exception as e:
@@ -244,24 +193,9 @@ class FrameLogin(ctk.CTkFrame):
         self.on_login_exitoso(usuario_id, username)
 
 
-# ---------------------------------------------------------------------------
-# Panel de Monitoreo (tarjeta de estado del canal)
-# ---------------------------------------------------------------------------
 class PanelMonitoreo(ctk.CTkFrame):
-    """
-    Tarjeta grande de estado del canal.
-
-    Combina dos fuentes:
-        - Telemetría en vivo (UDP, ~5 muestras/seg): el estado CONFIRMADO
-          del detector en este instante. Es la fuente principal de la
-          alerta, y funciona aunque el registro de eventos en la base
-          esté desactivado.
-        - Base de datos (`obtener_ultimo_evento`, cada
-          `INTERVALO_ACTUALIZACION_MS`): datos del último evento GUARDADO
-          (hora, duración, intensidad) para el detalle de la tarjeta.
-
-    Si no llega telemetría (main.py detenido o sin stream de la Raspberry
-    Pi), la tarjeta lo informa en lugar de mostrar "Entorno seguro".
+    """Tarjeta de estado: usa la telemetría en vivo para la alerta y la base
+    de datos para los detalles del último evento.
     """
 
     def __init__(self, master, usuario_id: int):
@@ -269,13 +203,11 @@ class PanelMonitoreo(ctk.CTkFrame):
         self.usuario_id = usuario_id
         self._detenido = False
 
-        # Estado en vivo (telemetría).
         self._momento_ultima_muestra: Optional[datetime] = None
         self._fs_ultima_muestra: Optional[float] = None
         self._movimiento_vivo: bool = False
         self._inicio_vivo: Optional[datetime] = None
         self._fin_vivo: Optional[datetime] = None
-        # Último evento guardado (base de datos).
         self._ultimo_evento: Optional[dict] = None
 
         self.grid_columnconfigure(0, weight=1)
@@ -307,7 +239,6 @@ class PanelMonitoreo(ctk.CTkFrame):
 
         self._programar_actualizacion(inmediato=True)
 
-    # -- Entrada de telemetría (hilo principal, la llama FramePrincipal) ----
     def recibir_muestra(self, muestra: dict) -> None:
         estaba_en_linea = self._sensor_en_linea()
         ahora = datetime.now()
@@ -320,16 +251,13 @@ class PanelMonitoreo(ctk.CTkFrame):
                 self._inicio_vivo, self._fin_vivo = ahora, None
             else:
                 self._fin_vivo = ahora
-                # El evento recién terminado se cierra en la base en el hilo
-                # de main.py: se consulta enseguida (sin esperar al ciclo de
-                # 3 s) para mostrar su duración e intensidad reales.
+                # Consulta puntual para mostrar la duración real del evento que terminó
                 self.after(DEMORA_CONSULTA_FIN_EVENTO_MS, self._disparar_consulta, False)
             self._movimiento_vivo = movimiento
-            self._renderizar()  # cambio de estado: se refleja al instante
+            self._renderizar()
         elif not estaba_en_linea:
-            self._renderizar()  # el sensor volvió a enviar datos
+            self._renderizar()
 
-    # -- Ciclo de actualización (base de datos) ------------------------------
     def _programar_actualizacion(self, inmediato: bool = False) -> None:
         if self._detenido:
             return
@@ -337,10 +265,8 @@ class PanelMonitoreo(ctk.CTkFrame):
         self.after(demora, self._disparar_consulta)
 
     def _disparar_consulta(self, reprogramar: bool = True) -> None:
-        """
-        Consulta el último evento en un hilo aparte. `reprogramar=False`
-        es para consultas puntuales (fin de un movimiento) que no deben
-        abrir un segundo ciclo periódico.
+        """Consulta el último evento en un hilo aparte (reprogramar=False para consultas
+        puntuales).
         """
         if self._detenido:
             return
@@ -348,7 +274,6 @@ class PanelMonitoreo(ctk.CTkFrame):
         hilo.start()
 
     def _consultar_en_hilo(self, reprogramar: bool) -> None:
-        """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
             ultimo_evento = obtener_ultimo_evento(self.usuario_id)
         except Exception as e:
@@ -365,7 +290,6 @@ class PanelMonitoreo(ctk.CTkFrame):
         if reprogramar:
             self._programar_actualizacion()
 
-    # -- Composición del estado visual ---------------------------------------
     def _sensor_en_linea(self) -> bool:
         return (
             self._momento_ultima_muestra is not None
@@ -378,9 +302,6 @@ class PanelMonitoreo(ctk.CTkFrame):
         evento = self._ultimo_evento
         en_linea = self._sensor_en_linea()
 
-        # Datos del evento guardado SOLO si corresponde al movimiento actual
-        # o al recién terminado (si el guardado está desactivado, el último
-        # evento de la base puede ser de hace horas).
         evento_reciente = None
         if evento is not None:
             fin = evento.get("timestamp_fin")
@@ -408,8 +329,6 @@ class PanelMonitoreo(ctk.CTkFrame):
             self._fin_vivo is not None
             and (ahora - self._fin_vivo).total_seconds() <= VENTANA_ALERTA_SEGUNDOS
         ):
-            # Movimiento recién terminado del que todavía no hay datos en
-            # la base (aún no se consultó, o el guardado está desactivado).
             self._pintar(
                 COLOR_ALERTA,
                 "¡MOVIMIENTO DETECTADO!",
@@ -443,19 +362,11 @@ class PanelMonitoreo(ctk.CTkFrame):
         self.label_detalle.configure(text=detalle)
 
     def detener(self) -> None:
-        """Frena el ciclo de refresco (llamar al cerrar la aplicación)."""
         self._detenido = True
 
 
-# ---------------------------------------------------------------------------
-# Panel de Configuración
-# ---------------------------------------------------------------------------
 class PanelConfiguracion(ctk.CTkFrame):
-    """
-    Muestra los parámetros actuales del usuario y permite modificar el
-    umbral de sensibilidad, persistiendo el cambio en
-    `configuracion_sistema` a través de `actualizar_configuracion_usuario`.
-    """
+    """Umbral de sensibilidad y opciones de guardar eventos y enviar alertas."""
 
     def __init__(self, master, usuario_id: int):
         super().__init__(master, fg_color="transparent")
@@ -471,13 +382,7 @@ class PanelConfiguracion(ctk.CTkFrame):
         ctk.CTkLabel(
             panel, text="Configuración del sistema",
             font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 4))
-
-        self.label_canal = ctk.CTkLabel(panel, text="Canal Wi-Fi: -")
-        self.label_canal.grid(row=1, column=0, sticky="w", padx=24, pady=2)
-
-        self.label_bssid = ctk.CTkLabel(panel, text="BSSID objetivo: -")
-        self.label_bssid.grid(row=2, column=0, sticky="w", padx=24, pady=(2, 16))
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 16))
 
         ctk.CTkLabel(
             panel, text="Umbral de sensibilidad (varianza mínima para disparar una alerta):",
@@ -487,8 +392,6 @@ class PanelConfiguracion(ctk.CTkFrame):
         fila_slider.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 4))
         fila_slider.grid_columnconfigure(0, weight=1)
 
-        # El slider trabaja internamente en log10(umbral); ver
-        # `_umbral_a_posicion_slider` / `_posicion_slider_a_umbral`.
         self.slider_umbral = ctk.CTkSlider(
             fila_slider,
             from_=math.log10(UMBRAL_MIN),
@@ -529,24 +432,35 @@ class PanelConfiguracion(ctk.CTkFrame):
             text_color="gray",
         ).grid(row=7, column=0, sticky="w", padx=24, pady=(0, 8))
 
+        self.switch_enviar_alertas = ctk.CTkSwitch(
+            panel, text="Enviar alertas de Windows (notificación y sonido)"
+        )
+        self.switch_enviar_alertas.grid(row=8, column=0, sticky="w", padx=24, pady=(8, 2))
+        self.switch_enviar_alertas.select()
+
+        ctk.CTkLabel(
+            panel,
+            text="Una alerta al terminar cada movimiento, con su inicio, fin y duración.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        ).grid(row=9, column=0, sticky="w", padx=24, pady=(0, 8))
+
         self.boton_guardar = ctk.CTkButton(
             panel, text="Guardar cambios", command=self._guardar_cambios
         )
-        self.boton_guardar.grid(row=8, column=0, sticky="w", padx=24, pady=(16, 4))
+        self.boton_guardar.grid(row=10, column=0, sticky="w", padx=24, pady=(16, 4))
 
         self.label_estado_guardado = ctk.CTkLabel(panel, text="", text_color="gray")
-        self.label_estado_guardado.grid(row=9, column=0, sticky="w", padx=24, pady=(0, 20))
+        self.label_estado_guardado.grid(row=11, column=0, sticky="w", padx=24, pady=(0, 20))
 
         self._cargar_configuracion()
 
-    # -- Carga inicial -------------------------------------------------
     def _cargar_configuracion(self) -> None:
         self.label_estado_guardado.configure(text="Cargando configuración...", text_color="gray")
         hilo = threading.Thread(target=self._cargar_en_hilo, daemon=True)
         hilo.start()
 
     def _cargar_en_hilo(self) -> None:
-        """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
             config = obtener_configuracion_usuario(self.usuario_id)
         except Exception as e:
@@ -563,17 +477,17 @@ class PanelConfiguracion(ctk.CTkFrame):
             return
 
         self._config_actual = config
-        self.label_canal.configure(text=f"Canal Wi-Fi: {config['canal_wifi']}")
-        self.label_bssid.configure(
-            text=f"BSSID objetivo: {config['bssid_objetivo'] or '(sin configurar)'}"
-        )
         umbral_guardado = float(config["umbral_sensibilidad"])
         self.slider_umbral.set(_umbral_a_posicion_slider(umbral_guardado))
         self.label_umbral_valor.configure(text=_formatear_umbral(umbral_guardado))
-        if config.get("guardar_eventos", True):
-            self.switch_guardar_eventos.select()
-        else:
-            self.switch_guardar_eventos.deselect()
+        for switch, clave in (
+            (self.switch_guardar_eventos, "guardar_eventos"),
+            (self.switch_enviar_alertas, "enviar_alertas"),
+        ):
+            if config.get(clave, True):
+                switch.select()
+            else:
+                switch.deselect()
         self.label_estado_guardado.configure(text="")
 
     def _on_slider_cambia(self, posicion: float) -> None:
@@ -581,7 +495,6 @@ class PanelConfiguracion(ctk.CTkFrame):
             text=_formatear_umbral(_posicion_slider_a_umbral(posicion))
         )
 
-    # -- Guardado --------------------------------------------------------
     def _guardar_cambios(self) -> None:
         if self._config_actual is None:
             self.label_estado_guardado.configure(
@@ -590,42 +503,44 @@ class PanelConfiguracion(ctk.CTkFrame):
             return
 
         nuevo_umbral = _posicion_slider_a_umbral(self.slider_umbral.get())
-        canal_actual = self._config_actual["canal_wifi"]
-        bssid_actual = self._config_actual["bssid_objetivo"]
         guardar_eventos = bool(self.switch_guardar_eventos.get())
+        enviar_alertas = bool(self.switch_enviar_alertas.get())
 
         self.boton_guardar.configure(state="disabled", text="Guardando...")
         self.label_estado_guardado.configure(text="")
 
         hilo = threading.Thread(
             target=self._guardar_en_hilo,
-            args=(nuevo_umbral, canal_actual, bssid_actual, guardar_eventos),
+            args=(nuevo_umbral, guardar_eventos, enviar_alertas),
             daemon=True,
         )
         hilo.start()
 
     def _guardar_en_hilo(
-        self, umbral: float, canal: int, bssid: Optional[str], guardar_eventos: bool
+        self, umbral: float, guardar_eventos: bool, enviar_alertas: bool
     ) -> None:
-        """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
             exito = actualizar_configuracion_usuario(
-                self.usuario_id, umbral, canal, bssid, guardar_eventos=guardar_eventos
+                self.usuario_id, umbral,
+                guardar_eventos=guardar_eventos, enviar_alertas=enviar_alertas,
             )
         except Exception as e:
             exito = False
             logger.error(f"Error al guardar configuración: {e}")
 
-        self.after(0, self._procesar_resultado_guardado, exito, umbral, guardar_eventos)
+        self.after(
+            0, self._procesar_resultado_guardado, exito, umbral, guardar_eventos, enviar_alertas
+        )
 
     def _procesar_resultado_guardado(
-        self, exito: bool, umbral_guardado: float, guardar_eventos: bool
+        self, exito: bool, umbral_guardado: float, guardar_eventos: bool, enviar_alertas: bool
     ) -> None:
         self.boton_guardar.configure(state="normal", text="Guardar cambios")
 
         if exito:
             self._config_actual["umbral_sensibilidad"] = umbral_guardado
             self._config_actual["guardar_eventos"] = guardar_eventos
+            self._config_actual["enviar_alertas"] = enviar_alertas
             self.label_estado_guardado.configure(
                 text=(
                     "✔ Configuración guardada. main.py la aplica en unos segundos."
@@ -638,19 +553,8 @@ class PanelConfiguracion(ctk.CTkFrame):
             )
 
 
-# ---------------------------------------------------------------------------
-# Receptor de telemetría UDP (background)
-# ---------------------------------------------------------------------------
 class ReceptorTelemetria:
-    """
-    Escucha datagramas UDP de telemetría enviados por `src/main.py` en
-    un hilo de background dedicado. El socket se abre con un timeout
-    corto para poder revisar periódicamente si se pidió detener el hilo.
-
-    El callback `on_muestra` se invoca DESDE ESTE HILO DE BACKGROUND —
-    quien lo registre debe usar `self.after(0, ...)` para volver al
-    hilo principal (ver `FramePrincipal._on_muestra_recibida`).
-    """
+    """Recibe la telemetría UDP en un hilo aparte y la pasa a un callback."""
 
     def __init__(self, host: str, port: int, on_muestra) -> None:
         self.host = host
@@ -694,29 +598,13 @@ class ReceptorTelemetria:
                     self.on_muestra(muestra)
 
 
-# ---------------------------------------------------------------------------
-# Pestaña de Telemetría en Tiempo Real
-# ---------------------------------------------------------------------------
 class PanelTelemetria(ctk.CTkFrame):
-    """
-    Pestaña de diagnóstico "Telemetría Live": recibe, por UDP, la
-    varianza promedio, la fs real y el estado del filtro de cada ventana
-    que procesa `src/main.py`, y los muestra en vivo — lecturas
-    numéricas más un gráfico de barras con la varianza reciente contra
-    la línea de umbral vigente.
-
-    Ventanas sin filtrar: su barra se dibuja en GRIS (nunca roja, porque
-    el trigger está inhibido) y se excluye del autoescalado vertical,
-    para que una varianza cruda de cientos de miles no aplaste visualmente
-    las barras filtradas válidas. La lectura "Filtro" y la línea de
-    detalle indican el motivo y el porcentaje de ventanas válidas.
-    """
+    """Lecturas en vivo y gráfico de varianza contra el umbral."""
 
     def __init__(self, master, usuario_id: int):
         super().__init__(master, fg_color="transparent")
         self.usuario_id = usuario_id
 
-        # Cada elemento: (varianza, filtro_aplicado).
         self.historial: Deque[Tuple[float, bool]] = deque(maxlen=MAX_MUESTRAS_TELEMETRIA)
         self.umbral_actual: float = 0.0
         self.umbral_salida: Optional[float] = None
@@ -724,7 +612,6 @@ class PanelTelemetria(ctk.CTkFrame):
 
         self.grid_columnconfigure(0, weight=1)
 
-        # --- Fila de lecturas numéricas ---
         fila_lecturas = ctk.CTkFrame(self, corner_radius=16)
         fila_lecturas.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 4))
         for col in range(5):
@@ -747,7 +634,6 @@ class PanelTelemetria(ctk.CTkFrame):
         )
         self.label_detalle_filtro.grid(row=1, column=0, sticky="w", padx=28, pady=(0, 8))
 
-        # --- Gráfico en vivo ---
         contenedor_grafico = ctk.CTkFrame(self, corner_radius=16)
         contenedor_grafico.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
         contenedor_grafico.grid_columnconfigure(0, weight=1)
@@ -755,14 +641,11 @@ class PanelTelemetria(ctk.CTkFrame):
         ctk.CTkLabel(
             contenedor_grafico,
             text=(
-                "Varianza reciente vs. umbral — línea punteada tenue: umbral de salida "
-                "(histéresis); gris: ventana sin filtrar"
+                "Varianza vs. umbral (punteada tenue: umbral de salida; gris: ventana sin filtrar)"
             ),
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
 
-        # Canvas nativo de Tkinter: liviano de redibujar en cada muestra,
-        # sin traer matplotlib para unas pocas barras.
         self.canvas_ancho = 760
         self.canvas_alto = 200
         self.canvas = tk.Canvas(
@@ -786,7 +669,6 @@ class PanelTelemetria(ctk.CTkFrame):
 
     @staticmethod
     def _crear_lectura(master, columna: int, titulo: str):
-        """Crea una lectura numérica (título chico + valor grande) en una columna del grid."""
         label_titulo = ctk.CTkLabel(
             master, text=titulo, font=ctk.CTkFont(size=11), text_color="gray"
         )
@@ -797,7 +679,6 @@ class PanelTelemetria(ctk.CTkFrame):
 
         return label_titulo, label_valor
 
-    # -- Actualización de UI (hilo principal, la llama FramePrincipal) ----
     def recibir_muestra(self, muestra: dict) -> None:
         if not self._ultima_muestra_recibida:
             self._ultima_muestra_recibida = True
@@ -807,7 +688,6 @@ class PanelTelemetria(ctk.CTkFrame):
         fs = muestra.get("fs_estimada")
         umbral = float(muestra.get("umbral_actual", self.umbral_actual))
         movimiento = bool(muestra.get("movimiento_detectado", False))
-        # Compatibilidad: un emisor viejo sin estos campos se asume filtrado.
         filtro_aplicado = bool(muestra.get("filtro_aplicado", True))
         estado_filtro = str(muestra.get("estado_filtro", ESTADO_FILTRO_SOS_OK))
         n_paquetes = muestra.get("n_paquetes_ventana")
@@ -827,9 +707,6 @@ class PanelTelemetria(ctk.CTkFrame):
                 text=f"{varianza:.4g} (cruda)", text_color=COLOR_SIN_FILTRO
             )
         else:
-            # Estado CONFIRMADO (con confirmación temporal e histéresis);
-            # una ventana sobre el umbral sin racha completa se muestra
-            # como "Confirmando n/N", no como movimiento.
             if movimiento:
                 texto_estado, color_estado = "MOVIMIENTO", COLOR_ALERTA
             elif supera_umbral:
@@ -853,7 +730,7 @@ class PanelTelemetria(ctk.CTkFrame):
         self.label_detalle_filtro.configure(
             text=(
                 f"Última ventana: {DESCRIPCION_ESTADO_FILTRO.get(estado_filtro, estado_filtro)}"
-                f"{texto_paquetes}   —   ventanas filtradas en el historial: "
+                f"{texto_paquetes} | ventanas filtradas: "
                 f"{n_validas}/{len(self.historial)} ({porcentaje:.0f}%)"
             ),
             text_color="gray" if filtro_aplicado else COLOR_ADVERTENCIA,
@@ -871,9 +748,6 @@ class PanelTelemetria(ctk.CTkFrame):
         margen_inferior = 20
         alto_util = self.canvas_alto - margen_inferior
 
-        # Escala vertical dinámica SÓLO con ventanas filtradas (más el
-        # umbral): las varianzas crudas quedan recortadas al tope del
-        # gráfico en gris, en vez de aplastar al resto de las barras.
         varianzas_validas = [v for v, ok in valores if ok]
         maximo_valido = max(varianzas_validas) if varianzas_validas else 0.0
         valor_maximo = max(maximo_valido, self.umbral_actual * 1.2, 0.01)
@@ -894,7 +768,6 @@ class PanelTelemetria(ctk.CTkFrame):
                 color = COLOR_REPOSO
             self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
 
-        # Línea del umbral de SALIDA (histéresis), más tenue.
         if self.umbral_salida is not None and self.umbral_salida > 0:
             y_salida = alto_util - (min(self.umbral_salida / valor_maximo, 1.0) * alto_util)
             self.canvas.create_line(
@@ -902,7 +775,6 @@ class PanelTelemetria(ctk.CTkFrame):
                 fill=COLOR_LINEA_UMBRAL_SALIDA, dash=(2, 4), width=1,
             )
 
-        # Línea de referencia del umbral vigente (entrada).
         y_umbral = alto_util - (min(self.umbral_actual / valor_maximo, 1.0) * alto_util)
         self.canvas.create_line(
             0, y_umbral, self.canvas_ancho, y_umbral, fill=COLOR_LINEA_UMBRAL, dash=(4, 2), width=2
@@ -917,16 +789,302 @@ class PanelTelemetria(ctk.CTkFrame):
         )
 
 
+class PanelHistorial(ctk.CTkScrollableFrame):
+    """Resumen, gráfico de eventos por día y tabla paginada de los movimientos guardados."""
 
-# ---------------------------------------------------------------------------
-# Panel principal (post-login)
-# ---------------------------------------------------------------------------
+    COLUMNAS = [("N°", 60), ("Fecha", 110), ("Inicio", 90), ("Fin", 90), ("Duración", 110), ("Intensidad", 100)]
+
+    def __init__(self, master, usuario_id: int):
+        super().__init__(master, fg_color="transparent")
+        self.usuario_id = usuario_id
+        self.periodo = "7 días"
+        self.pagina = 0
+        self.total_eventos = 0
+        self._id_consulta = 0
+        self._barras: list = []
+        self._resumen_diario: list = []
+        self._dias_grafico = 7
+
+        self.grid_columnconfigure(0, weight=1)
+
+        # Filtros
+        fila_filtros = ctk.CTkFrame(self, fg_color="transparent")
+        fila_filtros.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
+        fila_filtros.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(fila_filtros, text="Período:").grid(row=0, column=0, padx=(0, 8))
+        self.selector_periodo = ctk.CTkSegmentedButton(
+            fila_filtros, values=list(PERIODOS_HISTORIAL), command=self._on_cambio_periodo
+        )
+        self.selector_periodo.set(self.periodo)
+        self.selector_periodo.grid(row=0, column=1)
+        self.boton_actualizar = ctk.CTkButton(
+            fila_filtros, text="Actualizar", width=100, command=self.actualizar
+        )
+        self.boton_actualizar.grid(row=0, column=2, padx=(12, 0))
+        self.label_estado = ctk.CTkLabel(fila_filtros, text="", text_color="gray")
+        self.label_estado.grid(row=0, column=3, sticky="e")
+
+        # Resumen del período
+        fila_resumen = ctk.CTkFrame(self, corner_radius=16)
+        fila_resumen.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
+        self.valores_resumen = {}
+        for columna, (clave, titulo) in enumerate([
+            ("cantidad", "Eventos"),
+            ("duracion_total", "Tiempo en movimiento"),
+            ("duracion_promedio", "Duración promedio"),
+            ("varianza_pico", "Intensidad pico"),
+        ]):
+            fila_resumen.grid_columnconfigure(columna, weight=1)
+            _, self.valores_resumen[clave] = PanelTelemetria._crear_lectura(
+                fila_resumen, columna, titulo
+            )
+
+        # Gráfico
+        contenedor_grafico = ctk.CTkFrame(self, corner_radius=16)
+        contenedor_grafico.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
+        contenedor_grafico.grid_columnconfigure(0, weight=1)
+        self.label_titulo_grafico = ctk.CTkLabel(
+            contenedor_grafico, text="Eventos por día", font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.label_titulo_grafico.grid(row=0, column=0, sticky="w", padx=16, pady=(10, 2))
+        self.canvas = tk.Canvas(
+            contenedor_grafico, height=150, bg=COLOR_FONDO_GRAFICO, highlightthickness=0
+        )
+        self.canvas.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+        self.canvas.bind("<Configure>", lambda _e: self._dibujar_grafico())
+        self.canvas.bind("<Motion>", self._on_mouse_grafico)
+        self.canvas.bind("<Leave>", lambda _e: self._ocultar_tooltip())
+
+        # Tabla
+        tabla = ctk.CTkFrame(self, corner_radius=16)
+        tabla.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 6))
+        for columna, (titulo, ancho) in enumerate(self.COLUMNAS):
+            tabla.grid_columnconfigure(columna, weight=1, minsize=ancho)
+            ctk.CTkLabel(
+                tabla, text=titulo, font=ctk.CTkFont(size=12, weight="bold"), text_color="gray"
+            ).grid(row=0, column=columna, padx=6, pady=(10, 4))
+        self.filas_tabla = []
+        for fila in range(EVENTOS_POR_PAGINA):
+            celdas = []
+            for columna in range(len(self.COLUMNAS)):
+                celda = ctk.CTkLabel(tabla, text="", height=24)
+                celda.grid(row=fila + 1, column=columna, padx=6, pady=1)
+                celdas.append(celda)
+            self.filas_tabla.append(celdas)
+        self.label_tabla_vacia = ctk.CTkLabel(tabla, text="", text_color="gray")
+        self.label_tabla_vacia.grid(
+            row=EVENTOS_POR_PAGINA + 1, column=0, columnspan=len(self.COLUMNAS), pady=(0, 8)
+        )
+
+        # Paginación
+        fila_paginas = ctk.CTkFrame(self, fg_color="transparent")
+        fila_paginas.grid(row=4, column=0, pady=(0, 16))
+        self.boton_anterior = ctk.CTkButton(
+            fila_paginas, text="◀ Anterior", width=110, command=lambda: self._cambiar_pagina(-1)
+        )
+        self.boton_anterior.grid(row=0, column=0)
+        self.label_pagina = ctk.CTkLabel(fila_paginas, text="", width=200)
+        self.label_pagina.grid(row=0, column=1, padx=12)
+        self.boton_siguiente = ctk.CTkButton(
+            fila_paginas, text="Siguiente ▶", width=110, command=lambda: self._cambiar_pagina(1)
+        )
+        self.boton_siguiente.grid(row=0, column=2)
+
+    # -- Consultas -------------------------------------------------------------
+    def _on_cambio_periodo(self, periodo: str) -> None:
+        self.periodo = periodo
+        self.pagina = 0
+        self.actualizar()
+
+    def _cambiar_pagina(self, delta: int) -> None:
+        self.pagina += delta
+        self.actualizar()
+
+    def actualizar(self) -> None:
+        """Vuelve a consultar el período y la página actuales en un hilo aparte."""
+        self._id_consulta += 1
+        self.label_estado.configure(text="Cargando...")
+        self.boton_actualizar.configure(state="disabled")
+        dias = PERIODOS_HISTORIAL[self.periodo]
+        desde = date.today() - timedelta(days=dias - 1) if dias else None
+        dias_grafico = 30 if dias is None or dias > 7 else 7
+        threading.Thread(
+            target=self._consultar_en_hilo,
+            args=(self._id_consulta, desde, self.pagina, dias_grafico),
+            daemon=True,
+        ).start()
+
+    def _consultar_en_hilo(self, id_consulta: int, desde, pagina: int, dias_grafico: int) -> None:
+        """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
+        try:
+            datos = {
+                "estadisticas": obtener_estadisticas_periodo(self.usuario_id, desde=desde),
+                "total": contar_eventos_usuario(self.usuario_id, desde=desde),
+                "eventos": obtener_historico_usuario(
+                    self.usuario_id, limite=EVENTOS_POR_PAGINA,
+                    desplazamiento=pagina * EVENTOS_POR_PAGINA, desde=desde,
+                ),
+                "resumen_diario": obtener_resumen_diario(self.usuario_id, dias=dias_grafico),
+                "dias_grafico": dias_grafico,
+            }
+        except Exception as e:
+            logger.error(f"Error al consultar el historial: {e}")
+            datos = None
+        self.after(0, self._mostrar_datos, id_consulta, datos)
+
+    # -- Presentación ----------------------------------------------------------
+    def _mostrar_datos(self, id_consulta: int, datos: Optional[dict]) -> None:
+        if id_consulta != self._id_consulta:
+            return  # llegó la respuesta de una consulta vieja
+        self.boton_actualizar.configure(state="normal")
+        if datos is None:
+            self.label_estado.configure(text="No se pudo consultar la base.", text_color=COLOR_ERROR)
+            return
+        self.label_estado.configure(
+            text=f"Actualizado {datetime.now():%H:%M:%S}", text_color="gray"
+        )
+
+        estadisticas = datos["estadisticas"]
+        self.valores_resumen["cantidad"].configure(text=str(estadisticas["cantidad"]))
+        self.valores_resumen["duracion_total"].configure(
+            text=_formatear_duracion(estadisticas["duracion_total"])
+        )
+        self.valores_resumen["duracion_promedio"].configure(
+            text=_formatear_duracion(estadisticas["duracion_promedio"]) if estadisticas["cantidad"] else "—"
+        )
+        pico = estadisticas["varianza_pico"]
+        self.valores_resumen["varianza_pico"].configure(text="—" if pico is None else f"{pico:.2f}")
+
+        self._resumen_diario = datos["resumen_diario"]
+        self._dias_grafico = datos["dias_grafico"]
+        self.label_titulo_grafico.configure(
+            text=f"Eventos por día (últimos {self._dias_grafico} días)"
+        )
+        self._dibujar_grafico()
+
+        self.total_eventos = datos["total"]
+        paginas = max(1, math.ceil(self.total_eventos / EVENTOS_POR_PAGINA))
+        if self.pagina >= paginas:
+            self.pagina = paginas - 1
+            self.actualizar()
+            return
+        self._llenar_tabla(datos["eventos"])
+        self.label_pagina.configure(
+            text=f"Página {self.pagina + 1} de {paginas}  ·  {self.total_eventos} eventos"
+        )
+        self.boton_anterior.configure(state="normal" if self.pagina > 0 else "disabled")
+        self.boton_siguiente.configure(state="normal" if self.pagina < paginas - 1 else "disabled")
+
+    def _llenar_tabla(self, eventos: list) -> None:
+        for fila, celdas in enumerate(self.filas_tabla):
+            if fila < len(eventos):
+                evento = eventos[fila]
+                fin = evento.get("timestamp_fin")
+                textos = [
+                    str(evento["id"]),
+                    f"{evento['timestamp']:%d/%m/%Y}",
+                    f"{evento['timestamp']:%H:%M:%S}",
+                    f"{fin:%H:%M:%S}" if fin else "en curso",
+                    _formatear_duracion(evento.get("duracion_segundos")) if fin else "—",
+                    "—" if evento.get("varianza_maxima") is None else f"{evento['varianza_maxima']:.2f}",
+                ]
+            else:
+                textos = [""] * len(celdas)
+            for celda, texto in zip(celdas, textos):
+                celda.configure(text=texto)
+        self.label_tabla_vacia.configure(
+            text="" if eventos else "No hay movimientos registrados en este período."
+        )
+
+    def _dibujar_grafico(self) -> None:
+        self.canvas.delete("all")
+        ancho = max(self.canvas.winfo_width(), 200)
+        alto = int(self.canvas.cget("height"))
+        margen_izq, margen_der, margen_sup, margen_inf = 34, 10, 16, 22
+        alto_util = alto - margen_sup - margen_inf
+        ancho_util = ancho - margen_izq - margen_der
+
+        hoy = date.today()
+        por_dia = {fila["fecha"]: fila for fila in self._resumen_diario}
+        dias = [hoy - timedelta(days=i) for i in range(self._dias_grafico - 1, -1, -1)]
+        cantidades = [int(por_dia[d]["cantidad"]) if d in por_dia else 0 for d in dias]
+
+        maximo = max(cantidades + [1])
+        paso = max(1, math.ceil(maximo / 4))
+        tope = paso * math.ceil(maximo / paso)
+
+        def y_de(valor: float) -> float:
+            return margen_sup + alto_util * (1 - valor / tope)
+
+        # Grilla y eje Y (enteros)
+        for valor in range(0, tope + 1, paso):
+            y = y_de(valor)
+            self.canvas.create_line(margen_izq, y, ancho - margen_der, y, fill=COLOR_GRILLA)
+            self.canvas.create_text(
+                margen_izq - 6, y, text=str(valor), anchor="e", fill=COLOR_TEXTO_EJE, font=("", 9)
+            )
+
+        ancho_slot = ancho_util / len(dias)
+        ancho_barra = max(ancho_slot - 2, 1) if len(dias) > 7 else ancho_slot * 0.55
+        cada_cuanto_etiqueta = 1 if len(dias) <= 7 else 5
+        indice_maximo = cantidades.index(max(cantidades))
+        self._barras = []
+        for i, (dia, cantidad) in enumerate(zip(dias, cantidades)):
+            centro = margen_izq + ancho_slot * (i + 0.5)
+            x0, x1 = centro - ancho_barra / 2, centro + ancho_barra / 2
+            if cantidad > 0:
+                self.canvas.create_rectangle(
+                    x0, y_de(cantidad), x1, y_de(0), fill=COLOR_BARRA_HISTORIAL, outline=""
+                )
+            if i == indice_maximo and cantidad > 0:
+                self.canvas.create_text(
+                    centro, y_de(cantidad) - 7, text=str(cantidad), fill=COLOR_TEXTO_DATO,
+                    font=("", 9), tags="etiqueta_maximo",
+                )
+            if (len(dias) - 1 - i) % cada_cuanto_etiqueta == 0:
+                etiqueta = "Hoy" if dia == hoy else f"{dia:%d/%m}"
+                self.canvas.create_text(
+                    centro, alto - margen_inf + 12, text=etiqueta, fill=COLOR_TEXTO_EJE, font=("", 9)
+                )
+            fila = por_dia.get(dia)
+            duracion = float(fila["duracion_total"]) if fila else 0.0
+            self._barras.append((margen_izq + ancho_slot * i, margen_izq + ancho_slot * (i + 1), dia, cantidad, duracion))
+
+    def _ocultar_tooltip(self) -> None:
+        self.canvas.delete("tooltip")
+        self.canvas.itemconfigure("etiqueta_maximo", state="normal")
+
+    def _on_mouse_grafico(self, evento) -> None:
+        self._ocultar_tooltip()
+        for x0, x1, dia, cantidad, duracion in self._barras:
+            if x0 <= evento.x < x1:
+                texto = f"{dia:%d/%m}: {cantidad} evento{'s' if cantidad != 1 else ''}"
+                if cantidad:
+                    texto += f" · {_formatear_duracion(duracion)}"
+                ancho = int(self.canvas.winfo_width())
+                ancla = "e" if evento.x > ancho * 0.6 else "w"
+                desplazamiento = -10 if ancla == "e" else 10
+                item = self.canvas.create_text(
+                    evento.x + desplazamiento, 12, text=texto, anchor=ancla,
+                    fill=COLOR_TEXTO_DATO, font=("", 10), tags="tooltip",
+                )
+                x_a, y_a, x_b, y_b = self.canvas.bbox(item)
+                fondo = self.canvas.create_rectangle(
+                    x_a - 6, y_a - 3, x_b + 6, y_b + 3, fill="#2b2b2b", outline="#555555",
+                    tags="tooltip",
+                )
+                self.canvas.create_line(
+                    (x0 + x1) / 2, 18, (x0 + x1) / 2, int(self.canvas.cget("height")) - 22,
+                    fill="#555555", dash=(2, 2), tags="tooltip",
+                )
+                self.canvas.tag_raise(fondo)
+                self.canvas.tag_raise(item)
+                self.canvas.itemconfigure("etiqueta_maximo", state="hidden")
+                break
+
+
 class FramePrincipal(ctk.CTkFrame):
-    """
-    Contenedor post-login. Muestra un encabezado con el usuario actual y
-    un `CTkTabview` con las secciones de Monitoreo, Configuración y
-    Telemetría Live.
-    """
+    """Pestañas de la aplicación y receptor de telemetría compartido."""
 
     def __init__(self, master, usuario_id: int, username: str):
         super().__init__(master, fg_color="transparent")
@@ -946,16 +1104,20 @@ class FramePrincipal(ctk.CTkFrame):
             font=ctk.CTkFont(size=14, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
 
-        tabview = ctk.CTkTabview(self)
+        tabview = ctk.CTkTabview(self, command=self._on_cambio_pestania)
+        self.tabview = tabview
         tabview.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
         tab_monitoreo = tabview.add("Monitoreo")
         tab_configuracion = tabview.add("Configuración")
+        tab_historial = tabview.add("Historial")
         tab_telemetria = tabview.add("Telemetría Live")
 
         tab_monitoreo.grid_columnconfigure(0, weight=1)
         tab_configuracion.grid_columnconfigure(0, weight=1)
         tab_telemetria.grid_columnconfigure(0, weight=1)
+        tab_historial.grid_columnconfigure(0, weight=1)
+        tab_historial.grid_rowconfigure(0, weight=1)
 
         self.panel_monitoreo = PanelMonitoreo(tab_monitoreo, usuario_id=usuario_id)
         self.panel_monitoreo.grid(row=0, column=0, sticky="nsew")
@@ -963,20 +1125,23 @@ class FramePrincipal(ctk.CTkFrame):
         self.panel_configuracion = PanelConfiguracion(tab_configuracion, usuario_id=usuario_id)
         self.panel_configuracion.grid(row=0, column=0, sticky="nsew")
 
+        self.panel_historial = PanelHistorial(tab_historial, usuario_id=usuario_id)
+        self.panel_historial.grid(row=0, column=0, sticky="nsew")
+
         self.panel_telemetria = PanelTelemetria(tab_telemetria, usuario_id=usuario_id)
         self.panel_telemetria.grid(row=0, column=0, sticky="nsew")
 
-        # Un ÚNICO receptor de telemetría para toda la ventana: un puerto UDP
-        # sólo puede tener un receptor efectivo, y tanto Monitoreo como
-        # Telemetría Live necesitan las muestras. El receptor corre en un
-        # hilo de background y reenvía cada muestra al hilo principal.
+        # Un solo receptor UDP para toda la ventana; reparte las muestras a los paneles
         self.receptor = ReceptorTelemetria(
             host=HOST_TELEMETRIA, port=PUERTO_TELEMETRIA, on_muestra=self._on_muestra_recibida
         )
         self.receptor.iniciar()
 
+    def _on_cambio_pestania(self) -> None:
+        if self.tabview.get() == "Historial":
+            self.panel_historial.actualizar()
+
     def _on_muestra_recibida(self, muestra: dict) -> None:
-        """Corre en el hilo del ReceptorTelemetria: NO tocar widgets acá."""
         self.after(0, self._distribuir_muestra, muestra)
 
     def _distribuir_muestra(self, muestra: dict) -> None:
@@ -984,19 +1149,12 @@ class FramePrincipal(ctk.CTkFrame):
         self.panel_telemetria.recibir_muestra(muestra)
 
     def detener(self) -> None:
-        """Propaga la señal de detención a los sub-paneles con timers/hilos activos."""
         self.receptor.detener()
         self.panel_monitoreo.detener()
 
 
-# ---------------------------------------------------------------------------
-# Ventana principal de la aplicación
-# ---------------------------------------------------------------------------
 class DashboardApp(ctk.CTk):
-    """
-    Ventana raíz de la aplicación. Arranca mostrando `FrameLogin`; tras
-    una autenticación exitosa, la reemplaza por `FramePrincipal`.
-    """
+    """Ventana principal."""
 
     def __init__(self):
         super().__init__()
@@ -1033,15 +1191,11 @@ class DashboardApp(ctk.CTk):
         logger.info(f"Sesión iniciada: '{username}' (usuario_id={usuario_id}).")
 
     def _on_cerrar(self) -> None:
-        """Frena timers e hilos de los paneles antes de destruir la ventana."""
         if isinstance(self.frame_actual, FramePrincipal):
             self.frame_actual.detener()
         self.destroy()
 
 
-# ---------------------------------------------------------------------------
-# Punto de entrada
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     app = DashboardApp()
     app.mainloop()

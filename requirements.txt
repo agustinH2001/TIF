@@ -4,3 +4,4 @@ numpy
 scapy
 scipy
 customtkinter
+winotify; sys_platform == "win32"

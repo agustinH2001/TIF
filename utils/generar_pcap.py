@@ -1,7 +1,7 @@
 import struct
 import time
 
-# 1. El volcado hexadecimal exacto de tu consola
+# Volcado hexadecimal de una trama CSI capturada
 log_hex = """
 0000: ffff ffff ffff 4e45 584d 4f4e 0800 4500
 0010: 012e 0001 0000 0111 a4ab 0a0a 0a0a ffff
@@ -26,32 +26,25 @@ log_hex = """
 """
 
 def reconstruir_pcap(texto_hex, archivo_salida):
-    # Limpiar el texto y convertirlo en un array de bytes puros
     bytes_paquete = bytearray()
     for linea in texto_hex.strip().split('\n'):
         if ':' in linea:
-            # Quitamos el prefijo de memoria (ej: '0000:') y unimos los hex
             contenido_hex = linea.split(':')[1].replace(' ', '')
             bytes_paquete.extend(bytes.fromhex(contenido_hex))
-            
+
     longitud_trama = len(bytes_paquete)
-    
-    # --- ESTRUCTURA E ESTÁNDAR GLOBAL HEADER PCAP (24 bytes) ---
-    # Magic number (Identifica formato pcap) + Versión + Snaplen + LinkType (1 = Ethernet)
+
     pcap_global_header = struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
-    
-    # --- ESTRUCTURA DE LA CABECERA DEL PAQUETE (16 bytes) ---
-    # Segundos actuales + Microsegundos aproximados + Longitud capturada + Longitud original
+
     timestamp_segundos = int(time.time())
     timestamp_microsegundos = 908666
     pcap_packet_header = struct.pack('<IIII', timestamp_segundos, timestamp_microsegundos, longitud_trama, longitud_trama)
-    
-    # Escribir el archivo binario final
+
     with open(archivo_salida, 'wb') as f:
-        f.write(pcap_global_header)     # Cabecera global del archivo
-        f.write(pcap_packet_header)     # Cabecera de este paquete específico
-        f.write(bytes_paquete)          # Los bytes reales del CSI
-        
+        f.write(pcap_global_header)
+        f.write(pcap_packet_header)
+        f.write(bytes_paquete)
+
     print(f"¡Éxito! Archivo binario '{archivo_salida}' generado ({longitud_trama} bytes de payload).")
 
 if __name__ == "__main__":

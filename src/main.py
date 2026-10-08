@@ -1,71 +1,7 @@
-"""
-main.py
-=======
+"""Programa principal: recibe en vivo el stream pcap de la Raspberry Pi por TCP,
+arma ventanas de 2 s, detecta movimiento y publica telemetría para el Dashboard.
 
-Script ejecutable principal del Sistema de Detección Pasiva de Movimiento
-por CSI Wi-Fi — MODO EN VIVO (streaming TCP).
-
-Reemplaza a la versión anterior (que generaba ráfagas sintéticas para
-validar la lógica de DSP) ahora que el hardware ya captura datos CSI
-reales. Este orquestador:
-
-    1. Autentica al usuario, carga su configuración y      (BD)
-       cierra eventos que hayan quedado abiertos
-    2. Levanta un servidor TCP que recibe, en vivo, el      (sockets)
-       stream pcap que la Raspberry Pi envía por red
-    3. Reconstruye cada trama con Scapy y reutiliza los     (parser_csi)
-       extractores internos del parser offline
-    4. Acumula los vectores de amplitud en una ventana       (signal_filter)
-       deslizante, mide la fs REAL de cada ventana a partir
-       de los timestamps del propio stream pcap, y dispara
-       el pipeline de DSP + persistencia con esa fs (no una
-       fs fija asumida de antemano)
-    5. Publica telemetría en vivo (varianza, fs real, umbral,  (UDP)
-       si la ventana fue filtrada por el SOS y el progreso de la
-       confirmación temporal del trigger)
-       para que el Dashboard la muestre sin tener que tocar MySQL
-    6. Relee el umbral de sensibilidad cada cierta cantidad de   (hilo aparte)
-       ventanas procesadas, para enterarse si el usuario lo
-       cambió desde el Dashboard mientras el sistema corre
-
-Corrección de bug (fs real vs. fs asumida):
-    En la primera versión en vivo, el filtro Butterworth asumía una fs
-    fija de 100 Hz. La Raspberry Pi real entrega paquetes CSI a una tasa
-    mucho más alta y VARIABLE (~660-690 Hz medidos en pruebas sucesivas,
-    según condiciones de captura). La solución no es hardcodear 650 Hz,
-    sino medir la fs de CADA ventana a partir de sus propios timestamps y
-    pasársela a `DetectorMovimiento.procesar_ventana()` en cada llamada.
-
-Instrumentación del fallback de filtrado:
-    Con tráfico escaso (por ejemplo, un `ping` a 1 Hz desde el celular)
-    la fs real cae a 2-15 Hz y el pasabanda no se puede aplicar. Antes,
-    esa ventana se procesaba igual con la señal CRUDA y su varianza
-    (40.000-800.000) disparaba un falso positivo continuo. Ahora el
-    detector marca la ventana con `filtro_aplicado=False` y un
-    `estado_filtro` que explica el motivo, inhibe el trigger, y este
-    orquestador lo reporta en el log (WARNING sólo en las transiciones,
-    para no inundar la consola) y en la telemetría UDP.
-
-Cómo llega el stream:
-    La Raspberry Pi corre `tcpdump` en modo escritura-a-stdout ("-w -")
-    sobre la interfaz en modo monitor con Nexmon CSI activo, y entuba
-    esa salida por `netcat` hacia este servidor. El comando EXACTO a
-    correr en la Raspberry Pi se imprime en pantalla al arrancar este
-    script (ver `_imprimir_instrucciones_raspberry_pi`), porque depende
-    de la IP de esta PC en el momento de ejecutar.
-
-    El resultado es, ni más ni menos, un archivo .pcap normal pero
-    entregado por un socket en lugar de por disco: primero viaja la
-    cabecera global de 24 bytes, y después, para cada paquete
-    capturado, una cabecera de registro de 16 bytes (que informa cuántos
-    bytes de datos siguen) seguida de esos bytes crudos de la trama.
-
-Requisitos:
-    pip install scapy numpy
-
-Ejecución:
-    Desde la raíz del proyecto:  python src/main.py
-    Como módulo:                 python -m src.main
+Uso: python -m src.main [--verbose]
 """
 
 import argparse
@@ -82,9 +18,6 @@ from typing import Deque, Optional, Tuple
 import numpy as np
 from scapy.all import Ether
 
-# ---------------------------------------------------------------------------
-# Resolución de rutas / imports
-# ---------------------------------------------------------------------------
 RAIZ_PROYECTO = Path(__file__).resolve().parent.parent
 if str(RAIZ_PROYECTO) not in sys.path:
     sys.path.insert(0, str(RAIZ_PROYECTO))
@@ -94,16 +27,10 @@ from src.database.database import (
     obtener_configuracion_usuario,
     verificar_usuario,
 )
+from src.acciones.notificacion_windows import NotificadorWindows
 from src.database.registro_eventos import RegistroEventosAsincrono
 
-# Nota de arquitectura: `_extraer_payload_csi` y `_calcular_amplitud_fase`
-# están marcadas como privadas (prefijo "_") en parser_csi.py porque ahí
-# son detalles internos de `extraer_csi()`. Acá las reutilizamos a
-# propósito para no duplicar la lógica de filtrado/decodificación de
-# Nexmon CSI entre el modo offline (archivo .pcap) y el modo online
-# (socket en vivo) — la misma trama, venga de donde venga, se procesa
-# exactamente igual. Si este patrón se repite en un tercer lugar,
-# convendría promoverlas a funciones públicas de un módulo común.
+# Mismas funciones que usa el parser offline
 from src.parser.parser_csi import _calcular_amplitud_fase, _extraer_payload_csi
 from src.processing.signal_filter import (
     DESCRIPCION_ESTADO_FILTRO,
@@ -114,106 +41,52 @@ from src.processing.signal_filter import (
 )
 from src.common.telemetria_ipc import HOST_TELEMETRIA, PUERTO_TELEMETRIA, serializar_muestra
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("main")
 
-# ---------------------------------------------------------------------------
-# Constantes de sesión / autenticación
-# ---------------------------------------------------------------------------
 USERNAME_DEMO = "agustin_test"
 PASSWORD_DEMO = "Formosa2026!"
 
-# ---------------------------------------------------------------------------
-# Constantes del servidor TCP
-# ---------------------------------------------------------------------------
 HOST = "0.0.0.0"
 PORT = 9999
 
-# Si no llega ni un solo byte nuevo en este tiempo, se asume que la
-# Raspberry Pi perdió la conexión (se cortó el Wi-Fi, se reinició
-# tcpdump, se le fue la luz, etc.) y se vuelve a esperar una conexión
-# nueva, en vez de quedar bloqueado esperando para siempre.
 TIMEOUT_INACTIVIDAD_SEG = 30.0
 
-# ---------------------------------------------------------------------------
-# Constantes del formato de streaming pcap
-# ---------------------------------------------------------------------------
 LONGITUD_CABECERA_GLOBAL_PCAP = 24
 LONGITUD_CABECERA_PAQUETE_PCAP = 16
 
-# Cota superior razonable para el tamaño de un paquete (frame Ethernet).
-# Sirve para detectar un stream desincronizado: si "incl_len" da un
-# número disparatado, es señal de que dejamos de leer los bytes
-# alineados a un registro real, y no hay forma confiable de recuperarse
-# más que cerrar la conexión y esperar una nueva.
 LONGITUD_MAXIMA_PAQUETE_RAZONABLE = 65535
 
-MAGIC_NUMBER_US = 0xA1B2C3D4  # timestamps con resolución de microsegundos
-MAGIC_NUMBER_NS = 0xA1B23C4D  # timestamps con resolución de nanosegundos
+MAGIC_NUMBER_US = 0xA1B2C3D4
+MAGIC_NUMBER_NS = 0xA1B23C4D
 
-# ---------------------------------------------------------------------------
-# Constantes de la ventana deslizante
-# ---------------------------------------------------------------------------
-# IMPORTANTE: la ventana se define por TIEMPO REAL transcurrido, no por
-# una cantidad fija de paquetes. En pruebas sucesivas la tasa real de
-# paquetes CSI varió de ~2 Hz (ping desde el celular) a ~690 Hz (con
-# tráfico activo) — más de dos órdenes de magnitud de diferencia. Por
-# eso la ventana se arma acumulando paquetes hasta que el lapso entre el
-# primero y el último (medido con sus propios timestamps del pcap)
-# alcanza DURACION_VENTANA_SEG, sin importar cuántos paquetes hicieron
-# falta para llegar ahí.
-DURACION_VENTANA_SEG = 2.0        # duración real de cada ventana de análisis DSP
-PASO_DESLIZAMIENTO_SEG = 0.2      # avance real entre ventanas sucesivas
+# Ventana deslizante por tiempo real (no por cantidad de paquetes)
+DURACION_VENTANA_SEG = 2.0
+PASO_DESLIZAMIENTO_SEG = 0.2
 
-# Techo de seguridad de memoria: por más que la tasa real sea rarísima
-# (timestamps corridos, reloj de la RPi desincronizado, etc.), el
-# buffer nunca debe crecer sin límite.
 MAX_PAQUETES_BUFFER_SEGURIDAD = 50_000
 
-# Si pasan más de este tiempo sin completar una ventana, se informa en
-# el log cuántos paquetes se acumularon hasta ahora (a lo sumo una vez
-# cada tantos segundos, para no inundar la consola).
 INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG = 5.0
 
-# Cada cuánto se imprime el resumen periódico (INFO) en lugar de una línea
-# por ventana. El detalle por ventana sigue disponible con --verbose.
 INTERVALO_RESUMEN_SEG = 10.0
 
-# Mientras las ventanas sigan sin poder filtrarse, se repite el WARNING
-# como recordatorio cada este tiempo (además del aviso en la transición).
 INTERVALO_RECORDATORIO_SIN_FILTRO_SEG = 10.0
 
-# ---------------------------------------------------------------------------
-# Constantes de la relectura periódica de configuración
-# ---------------------------------------------------------------------------
-# Con paso de deslizamiento de 0.2s, se procesa una ventana nueva
-# aproximadamente cada 200ms (~5 ventanas/seg). Releer MySQL en CADA
-# ventana sería un desperdicio (y un riesgo: cualquier consulta corre en
-# el hilo que también lee el socket TCP de la Raspberry Pi). En cambio,
-# cada BLOQUES_ENTRE_RELECTURAS_CONFIG ventanas se le pide a un hilo de
-# background que vuelva a consultar `configuracion_sistema`.
-BLOQUES_ENTRE_RELECTURAS_CONFIG = 25  # ≈ cada 5 segundos a ~5 ventanas/seg
+# Cada cuántas ventanas se relee la configuración (~5 s)
+BLOQUES_ENTRE_RELECTURAS_CONFIG = 25
 
-# Techo de seguridad: aunque no se junten BLOQUES_ENTRE_RELECTURAS_CONFIG
-# ventanas, el hilo de relectura igual revisa la configuración cada tanto.
 TIMEOUT_ESPERA_RELECTURA_SEG = 10.0
 
 
 class ErrorProtocoloPcap(Exception):
-    """El stream recibido no respeta el formato pcap esperado (posible desincronización)."""
+    """El stream no respeta el formato pcap."""
 
 
-# ---------------------------------------------------------------------------
-# Paso 1: Autenticación y configuración
-# ---------------------------------------------------------------------------
 def autenticar_usuario() -> Optional[int]:
-    """Simula el inicio de sesión invocando la misma verificación que usaría cualquier interfaz real."""
+    """Inicia sesión con el usuario configurado. Devuelve el id o None."""
     logger.info(f"Autenticando usuario '{USERNAME_DEMO}'...")
     usuario_id = verificar_usuario(USERNAME_DEMO, PASSWORD_DEMO)
 
@@ -229,7 +102,7 @@ def autenticar_usuario() -> Optional[int]:
 
 
 def cargar_configuracion(usuario_id: int) -> Optional[dict]:
-    """Recupera umbral_sensibilidad, canal_wifi y bssid_objetivo desde configuracion_sistema."""
+    """Lee la configuración del usuario desde la base."""
     logger.info(f"Cargando configuración del sistema (usuario_id={usuario_id})...")
     config = obtener_configuracion_usuario(usuario_id)
 
@@ -239,8 +112,7 @@ def cargar_configuracion(usuario_id: int) -> Optional[dict]:
 
     logger.info(
         f"Configuración cargada -> umbral_sensibilidad={config['umbral_sensibilidad']}, "
-        f"canal_wifi={config['canal_wifi']}, bssid_objetivo={config['bssid_objetivo']}, "
-        f"guardar_eventos={config['guardar_eventos']}"
+        f"guardar_eventos={config['guardar_eventos']}, enviar_alertas={config['enviar_alertas']}"
     )
     return config
 
@@ -248,21 +120,12 @@ def cargar_configuracion(usuario_id: int) -> Optional[dict]:
 def _hilo_relectura_configuracion(
     usuario_id: int,
     detector: DetectorMovimiento,
+    registro_eventos: RegistroEventosAsincrono,
+    notificador: NotificadorWindows,
     evento_relectura: threading.Event,
     detener_evento: threading.Event,
 ) -> None:
-    """
-    Hilo de background dedicado exclusivamente a releer
-    `configuracion_sistema` cada vez que el hilo caliente le avisa que
-    pasaron `BLOQUES_ENTRE_RELECTURAS_CONFIG` ventanas procesadas —o,
-    como máximo, cada `TIMEOUT_ESPERA_RELECTURA_SEG` segundos.
-
-    Corre en su propio hilo a propósito: si esta consulta a MySQL
-    tardara, NUNCA debe frenar la lectura de paquetes CSI en vivo.
-    Actualiza `detector.umbral_sensibilidad` directamente; una simple
-    reasignación de atributo es atómica a nivel de bytecode en
-    CPython, así que no hace falta ningún Lock para esto.
-    """
+    """Relee la configuración periódicamente y aplica los cambios hechos desde el Dashboard."""
     while not detener_evento.is_set():
         disparado_por_bloques = evento_relectura.wait(timeout=TIMEOUT_ESPERA_RELECTURA_SEG)
         if detener_evento.is_set():
@@ -279,12 +142,20 @@ def _hilo_relectura_configuracion(
             continue
 
         nuevo_guardar = config["guardar_eventos"]
-        if nuevo_guardar != detector.persistir_eventos:
+        if nuevo_guardar != registro_eventos.habilitada:
             logger.info(
                 f"Registro de eventos {'ACTIVADO' if nuevo_guardar else 'DESACTIVADO'} "
                 f"desde el Dashboard."
             )
-            detector.persistir_eventos = nuevo_guardar
+            registro_eventos.habilitada = nuevo_guardar
+
+        nuevo_alertas = config["enviar_alertas"]
+        if nuevo_alertas != notificador.habilitada:
+            logger.info(
+                f"Alertas de Windows {'ACTIVADAS' if nuevo_alertas else 'DESACTIVADAS'} "
+                f"desde el Dashboard."
+            )
+            notificador.habilitada = nuevo_alertas
 
         nuevo_umbral = config["umbral_sensibilidad"]
         if nuevo_umbral != detector.umbral_sensibilidad:
@@ -301,12 +172,7 @@ def _enviar_telemetria(
     fs_estimada: Optional[float],
     umbral_actual: float,
 ) -> None:
-    """
-    Publica la muestra de telemetría de esta ventana hacia el Dashboard
-    por UDP (ver `src/common/telemetria_ipc.py`). Es estrictamente "fire
-    and forget": si falla, se descarta en silencio (a nivel DEBUG) sin
-    afectar al hilo que lee paquetes CSI en vivo.
-    """
+    """Envía por UDP los datos de la ventana al Dashboard."""
     payload = serializar_muestra(
         varianza_promedio=resultado["varianza_promedio"],
         fs_estimada=fs_estimada,
@@ -327,42 +193,19 @@ def _enviar_telemetria(
         logger.debug(f"No se pudo enviar telemetría UDP (se ignora, no es crítico): {e}")
 
 
-# ---------------------------------------------------------------------------
-# Paso 2: Desempaquetado robusto del stream pcap sobre el socket TCP
-# ---------------------------------------------------------------------------
 def _recibir_exacto(conexion: socket.socket, n_bytes: int) -> Optional[bytes]:
-    """
-    Lee exactamente `n_bytes` de un socket TCP.
-
-    Los sockets TCP son de flujo continuo: un solo `recv()` puede
-    devolver menos bytes de los pedidos. Por eso hay que iterar hasta
-    completar el total solicitado en lugar de confiar en una única llamada.
-
-    Returns:
-        bytes de longitud exacta `n_bytes`, o None si la conexión se
-        cerró (recv() devolvió b"") antes de completar la lectura.
-    """
+    """Lee exactamente n_bytes del socket. Devuelve None si se cierra la conexión."""
     buffer = bytearray()
     while len(buffer) < n_bytes:
         fragmento = conexion.recv(n_bytes - len(buffer))
         if not fragmento:
-            return None  # el peer cerró la conexión
+            return None
         buffer.extend(fragmento)
     return bytes(buffer)
 
 
 def _leer_cabecera_global(conexion: socket.socket) -> Optional[Tuple[str, bool]]:
-    """
-    Lee la cabecera global de 24 bytes del stream pcap y determina, a
-    partir del "magic number", el orden de bytes (endianness) y la
-    resolución temporal (microsegundos o nanosegundos) del resto del
-    stream.
-
-    Returns:
-        Tupla (orden_bytes, es_nanosegundos), donde orden_bytes es '<'
-        (little-endian) o '>' (big-endian). None si la cabecera es
-        inválida o la conexión se cerró antes de completarla.
-    """
+    """Lee la cabecera global del pcap. Devuelve (orden_bytes, es_nanosegundos) o None."""
     cabecera = _recibir_exacto(conexion, LONGITUD_CABECERA_GLOBAL_PCAP)
     if cabecera is None:
         return None
@@ -384,22 +227,10 @@ def _leer_cabecera_global(conexion: socket.socket) -> Optional[Tuple[str, bool]]
 def _recibir_siguiente_paquete(
     conexion: socket.socket, orden_bytes: str, es_nanosegundos: bool
 ) -> Optional[Tuple[bytes, float]]:
-    """
-    Lee un registro completo de paquete del stream pcap: la cabecera de
-    16 bytes (timestamp + incl_len + orig_len) y, a continuación,
-    exactamente `incl_len` bytes de datos crudos de la trama.
-
-    Returns:
-        Tupla (bytes_de_la_trama, timestamp_epoch_segundos), o None si
-        la conexión se cerró de forma prolija (fin de stream).
-
-    Raises:
-        ErrorProtocoloPcap: si `incl_len` da un valor fuera de rango
-            razonable (stream desincronizado).
-    """
+    """Lee el próximo paquete del stream. Devuelve (datos, timestamp) o None al terminar."""
     cabecera = _recibir_exacto(conexion, LONGITUD_CABECERA_PAQUETE_PCAP)
     if cabecera is None:
-        return None  # fin de stream prolijo
+        return None
 
     ts_principal, ts_fraccion, incl_len, _orig_len = struct.unpack(
         f"{orden_bytes}IIII", cabecera
@@ -412,7 +243,7 @@ def _recibir_siguiente_paquete(
 
     datos = _recibir_exacto(conexion, incl_len)
     if datos is None:
-        return None  # se cortó a mitad de un paquete: se trata como fin de stream
+        return None
 
     divisor = 1_000_000_000.0 if es_nanosegundos else 1_000_000.0
     timestamp = ts_principal + (ts_fraccion / divisor)
@@ -420,21 +251,8 @@ def _recibir_siguiente_paquete(
     return datos, timestamp
 
 
-# ---------------------------------------------------------------------------
-# Paso 3: Reconstrucción con Scapy + reutilización del parser interno
-# ---------------------------------------------------------------------------
 def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
-    """
-    Reconstruye la trama de red con Scapy (`Ether(datos_ethernet)`) en
-    lugar de recortar bytes de forma estática, y reutiliza los mismos
-    extractores internos del parser offline para que una trama CSI se
-    procese exactamente igual, venga de un archivo .pcap o de este
-    stream en vivo.
-
-    Returns:
-        Vector de amplitud (np.ndarray, una posición por subportadora),
-        o None si la trama no es una trama CSI de Nexmon válida.
-    """
+    """Devuelve el vector de amplitudes de una trama CSI, o None si no lo es."""
     try:
         paquete = Ether(datos_ethernet)
     except Exception as e:
@@ -443,7 +261,7 @@ def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
 
     datos_iq = _extraer_payload_csi(paquete)
     if datos_iq is None:
-        return None  # no era una trama CSI (puerto/MAC no coinciden)
+        return None
 
     amplitud, _fase = _calcular_amplitud_fase(datos_iq)
     if amplitud.size == 0:
@@ -452,19 +270,8 @@ def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
     return amplitud
 
 
-# ---------------------------------------------------------------------------
-# Paso 4: Ventana deslizante + disparo del pipeline de DSP
-# ---------------------------------------------------------------------------
 class ResumenPeriodico:
-    """
-    Acumula estadísticas de las ventanas procesadas e imprime UNA línea
-    de resumen cada `INTERVALO_RESUMEN_SEG` segundos (tiempo de pared),
-    en lugar de una línea por ventana (~5 por segundo), que vuelve el log
-    ilegible en operación normal.
-
-    Sólo las ventanas filtradas entran en las estadísticas de varianza:
-    la varianza de una ventana cruda no es comparable.
-    """
+    """Junta estadísticas de las ventanas e imprime un resumen cada INTERVALO_RESUMEN_SEG."""
 
     def __init__(self, intervalo_seg: float = INTERVALO_RESUMEN_SEG) -> None:
         self.intervalo_seg = intervalo_seg
@@ -525,17 +332,7 @@ def _procesar_stream(
     sock_telemetria: socket.socket,
     evento_relectura: threading.Event,
 ) -> None:
-    """
-    Consume el stream pcap de una conexión ya aceptada: lee la cabecera
-    global, y después entra en un loop que arma la ventana deslizante de
-    amplitudes y dispara `detector.procesar_ventana()` cada vez que el
-    lapso entre el primer y el último paquete acumulado alcanza
-    `DURACION_VENTANA_SEG` segundos reales.
-
-    Vuelve (return) apenas la conexión se cierra o se detecta un
-    problema irrecuperable, dejando que `_ejecutar_servidor` acepte una
-    nueva conexión sin caerse.
-    """
+    """Lee los paquetes de una conexión, arma la ventana deslizante y la procesa."""
     resultado_cabecera = _leer_cabecera_global(conexion)
     if resultado_cabecera is None:
         logger.error("No se pudo leer una cabecera global de pcap válida. Cerrando conexión.")
@@ -548,7 +345,6 @@ def _procesar_stream(
         f"resolución: {'nanosegundos' if es_nanosegundos else 'microsegundos'})."
     )
 
-    # Cada elemento del buffer es (vector_amplitud, timestamp_del_paquete).
     buffer_ventana: Deque[Tuple[np.ndarray, float]] = deque(maxlen=MAX_PAQUETES_BUFFER_SEGURIDAD)
 
     n_subportadoras_esperado: Optional[int] = None
@@ -557,17 +353,9 @@ def _procesar_stream(
     n_ventanas_desde_ultima_relectura = 0
     resumen = ResumenPeriodico()
 
-    # Aviso de ventana lenta: se mide cuánto tiempo DE PARED lleva el
-    # sistema esperando completar la próxima ventana, y sólo se avisa si
-    # esa espera supera INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG. (Antes se
-    # avisaba con el primer paquete después de CADA ventana, lo que
-    # llenaba el log aunque la tasa fuera perfectamente normal.)
     momento_inicio_espera: float = time.time()
     momento_ultimo_aviso_lento: Optional[float] = None
 
-    # Seguimiento del estado del filtro para avisar sólo en transiciones.
-    # Se arranca asumiendo SOS_OK para que la primera ventana inválida
-    # genere el WARNING de inmediato.
     ultimo_estado_filtro: str = ESTADO_FILTRO_SOS_OK
     momento_ultimo_recordatorio_sin_filtro: Optional[float] = None
     n_ventanas_sin_filtro_seguidas = 0
@@ -590,9 +378,6 @@ def _procesar_stream(
             n_paquetes_descartados += 1
             continue
 
-        # Validación de consistencia: todas las ventanas deben tener la
-        # misma cantidad de subportadoras para poder apilarse en una
-        # matriz rectangular.
         if n_subportadoras_esperado is None:
             n_subportadoras_esperado = vector_amplitud.shape[0]
         elif vector_amplitud.shape[0] != n_subportadoras_esperado:
@@ -616,19 +401,13 @@ def _procesar_stream(
                 or (ahora - momento_ultimo_aviso_lento) >= INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG
             ):
                 logger.warning(
-                    f"Tasa de paquetes baja: hace {ahora - momento_inicio_espera:.0f}s que "
-                    f"no se completa una ventana. Acumulando paquetes para completar una ventana de "
-                    f"{DURACION_VENTANA_SEG:.1f}s reales: llevamos "
-                    f"{len(buffer_ventana)} paquetes CSI válidos "
-                    f"({duracion_acumulada:.2f}s de datos reales). Si esto tarda "
-                    f"mucho, la tasa real de paquetes es muy baja — generá tráfico "
-                    f"controlado desde el dispositivo filtrado por Nexmon (por "
-                    f"ejemplo, iperf3 UDP a ~200 paquetes/seg)."
+                    f"Tasa de paquetes baja: {len(buffer_ventana)} paquetes CSI en "
+                    f"{ahora - momento_inicio_espera:.0f}s sin completar una ventana. "
+                    f"Verificá el tráfico iperf3."
                 )
                 momento_ultimo_aviso_lento = ahora
             continue
 
-        # Ventana completa (por tiempo real, no por cantidad de paquetes).
         resultado, fs_estimada = _procesar_ventana_completa(
             buffer_ventana, detector, sock_telemetria, n_paquetes_csi, n_paquetes_descartados
         )
@@ -638,7 +417,6 @@ def _procesar_stream(
         resumen.registrar(resultado, fs_estimada)
         resumen.emitir_si_corresponde(detector, resultado["movimiento_detectado"])
 
-        # --- Aviso explícito del fallback de filtrado ---------------------
         estado_filtro = resultado["estado_filtro"]
         ahora = time.time()
         if resultado["filtro_aplicado"]:
@@ -670,16 +448,11 @@ def _procesar_stream(
                 momento_ultimo_recordatorio_sin_filtro = ahora
         ultimo_estado_filtro = estado_filtro
 
-        # Cada BLOQUES_ENTRE_RELECTURAS_CONFIG ventanas, se le avisa al
-        # hilo de relectura que vuelva a consultar la BD.
         n_ventanas_desde_ultima_relectura += 1
         if n_ventanas_desde_ultima_relectura >= BLOQUES_ENTRE_RELECTURAS_CONFIG:
             n_ventanas_desde_ultima_relectura = 0
             evento_relectura.set()
 
-        # Ventana deslizante POR TIEMPO: se descartan los paquetes más
-        # viejos hasta que la ventana restante mida aproximadamente
-        # (DURACION_VENTANA_SEG - PASO_DESLIZAMIENTO_SEG) segundos.
         limite_tiempo = buffer_ventana[-1][1] - (DURACION_VENTANA_SEG - PASO_DESLIZAMIENTO_SEG)
         while len(buffer_ventana) > 1 and buffer_ventana[0][1] < limite_tiempo:
             buffer_ventana.popleft()
@@ -692,14 +465,8 @@ def _procesar_ventana_completa(
     n_paquetes_csi: int,
     n_paquetes_descartados: int,
 ) -> Tuple[dict, Optional[float]]:
-    """
-    Convierte el buffer actual en una matriz de NumPy, mide la fs real de
-    la ventana a partir de los timestamps del propio stream pcap, y se la
-    pasa al motor de DSP (`DetectorMovimiento`). Publica además la
-    telemetría de esta ventana por UDP.
-
-    Returns:
-        Tupla (resultado_del_detector, fs_estimada).
+    """Calcula la fs real de la ventana, la procesa y envía la telemetría. Devuelve (resultado,
+    fs).
     """
     vectores = [item[0] for item in buffer_ventana]
     timestamps = [item[1] for item in buffer_ventana]
@@ -725,8 +492,6 @@ def _procesar_ventana_completa(
     else:
         estado_legible = "reposo"
 
-    # Detalle por ventana: sólo con --verbose (nivel DEBUG). En operación
-    # normal lo reemplaza el resumen periódico de ResumenPeriodico.
     texto_fs = f"{fs_estimada:.1f}Hz" if fs_estimada is not None else "N/D"
     logger.debug(
         f"[Ventana procesada] estado={estado_legible} | "
@@ -744,15 +509,8 @@ def _procesar_ventana_completa(
     return resultado, fs_estimada
 
 
-# ---------------------------------------------------------------------------
-# Servidor TCP: acepta conexiones y sobrevive a desconexiones de la RPi
-# ---------------------------------------------------------------------------
 def _obtener_ip_local_probable() -> str:
-    """
-    Determina la IP de esta PC en la red local, para poder mostrarla en
-    las instrucciones de la Raspberry Pi. UDP connect() no transmite
-    nada: sólo hace que el SO elija la interfaz de salida.
-    """
+    """IP de esta PC en la red local (para mostrar el comando de la Raspberry Pi)."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -762,7 +520,7 @@ def _obtener_ip_local_probable() -> str:
 
 
 def _imprimir_instrucciones_raspberry_pi() -> None:
-    """Imprime el comando exacto a correr en la Raspberry Pi para iniciar el envío del stream."""
+    """Muestra el comando a ejecutar en la Raspberry Pi."""
     ip_local = _obtener_ip_local_probable()
     comando = f"sudo tcpdump -i wlan0 -U -w - udp port 5500 | nc {ip_local} {PORT}"
 
@@ -788,11 +546,7 @@ def _ejecutar_servidor(
     sock_telemetria: socket.socket,
     evento_relectura: threading.Event,
 ) -> None:
-    """
-    Levanta el servidor TCP y acepta conexiones en un loop infinito: si
-    la Raspberry Pi se desconecta, vuelve a esperar una conexión nueva
-    en lugar de terminar el proceso.
-    """
+    """Acepta conexiones de la Raspberry Pi; si una se corta, espera la siguiente."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
         servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         servidor.bind((HOST, PORT))
@@ -802,7 +556,7 @@ def _ejecutar_servidor(
         _imprimir_instrucciones_raspberry_pi()
         logger.info("Esperando a que la Raspberry Pi se conecte...")
 
-        while True:  # loop de aceptación: sobrevive a desconexiones individuales
+        while True:
             conexion, direccion = servidor.accept()
             conexion.settimeout(TIMEOUT_INACTIVIDAD_SEG)
             logger.info(f"Raspberry Pi conectada desde {direccion[0]}:{direccion[1]}.")
@@ -817,17 +571,12 @@ def _ejecutar_servidor(
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 logger.warning(f"Conexión con la Raspberry Pi interrumpida: {e}")
             finally:
-                # Si el stream se cortó en medio de un movimiento, se cierra
-                # el evento ahora: no tiene sentido dejarlo "en curso"
-                # esperando una conexión que puede tardar minutos.
+                # Si se corta el stream durante un movimiento, se cierra el evento
                 detector.forzar_fin_evento()
                 conexion.close()
                 logger.info("Conexión cerrada. Esperando una nueva conexión...\n")
 
 
-# ---------------------------------------------------------------------------
-# Orquestación principal
-# ---------------------------------------------------------------------------
 def _parsear_argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Orquestador en vivo del sistema de detección de movimiento por CSI Wi-Fi."
@@ -844,8 +593,6 @@ def _parsear_argumentos() -> argparse.Namespace:
 def main() -> None:
     argumentos = _parsear_argumentos()
     if argumentos.verbose:
-        # Sólo los loggers propios: subir el root a DEBUG traería también
-        # el ruido interno de mysql-connector y scapy.
         logger.setLevel(logging.DEBUG)
         logging.getLogger("signal_filter").setLevel(logging.DEBUG)
         for handler in logging.getLogger().handlers:
@@ -864,8 +611,7 @@ def main() -> None:
     if config is None:
         sys.exit(1)
 
-    # Eventos que quedaron "en curso" si el proceso anterior se cortó a
-    # mitad de un movimiento (cierre abrupto de la terminal, etc.).
+    # Eventos que quedaron abiertos en una ejecución anterior
     n_cerrados = cerrar_eventos_abiertos(usuario_id)
     if n_cerrados:
         logger.warning(
@@ -873,41 +619,38 @@ def main() -> None:
             f"en una ejecución anterior (se registran con duración 0)."
         )
 
-    # Escritor de eventos en un hilo de background: el detector nunca
-    # espera a MySQL (ver src/database/registro_eventos.py).
-    registro_eventos = RegistroEventosAsincrono(usuario_id)
-    registro_eventos.iniciar()
+    # Acciones que se ejecutan con cada evento de movimiento, cada una en su propio hilo
+    registro_eventos = RegistroEventosAsincrono(usuario_id, habilitada=config["guardar_eventos"])
+    notificador = NotificadorWindows(habilitada=config["enviar_alertas"])
+    acciones = [registro_eventos, notificador]
+    for accion in acciones:
+        accion.iniciar()
 
     detector = DetectorMovimiento(
         usuario_id=usuario_id,
         umbral_sensibilidad=config["umbral_sensibilidad"],
         frecuencia_muestreo=FRECUENCIA_MUESTREO_DEFAULT_HZ,
-        registro_eventos=registro_eventos,
-        persistir_eventos=config["guardar_eventos"],
+        acciones=acciones,
     )
     logger.info(
-        f"DetectorMovimiento inicializado con umbral_sensibilidad="
-        f"{config['umbral_sensibilidad']} (fs de fallback={FRECUENCIA_MUESTREO_DEFAULT_HZ} Hz; "
-        f"en vivo se usa la fs REAL de cada ventana; por debajo de "
-        f"{FS_MINIMA_CONFIABLE_HZ:.0f} Hz la ventana no se filtra y el trigger se inhibe). "
-        f"Confirmación: {detector.ventanas_confirmacion_entrada} ventanas para entrar, "
-        f"{detector.ventanas_confirmacion_salida} bajo {detector.factor_histeresis:.0%} "
-        f"del umbral para salir. Registro de eventos en la base: "
-        f"{'activado' if config['guardar_eventos'] else 'DESACTIVADO'}."
+        f"Detector listo: umbral={config['umbral_sensibilidad']}, "
+        f"fs mínima={FS_MINIMA_CONFIABLE_HZ:.0f} Hz, "
+        f"confirmación={detector.ventanas_confirmacion_entrada}/"
+        f"{detector.ventanas_confirmacion_salida} ventanas, "
+        f"histéresis={detector.factor_histeresis:.0%}, "
+        f"guardar eventos={'sí' if config['guardar_eventos'] else 'no'}, "
+        f"alertas={'sí' if config['enviar_alertas'] else 'no'}."
     )
 
-    # Socket UDP de telemetría hacia el Dashboard. connect() sobre UDP no
-    # hace ningún handshake: sólo fija el destino por defecto.
     sock_telemetria = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_telemetria.connect((HOST_TELEMETRIA, PUERTO_TELEMETRIA))
     logger.info(f"Telemetría UDP configurada hacia {HOST_TELEMETRIA}:{PUERTO_TELEMETRIA}.")
 
-    # Hilo de background para la relectura periódica de umbral_sensibilidad.
     evento_relectura = threading.Event()
     detener_relectura = threading.Event()
     hilo_relectura = threading.Thread(
         target=_hilo_relectura_configuracion,
-        args=(usuario_id, detector, evento_relectura, detener_relectura),
+        args=(usuario_id, detector, registro_eventos, notificador, evento_relectura, detener_relectura),
         daemon=True,
         name="relectura-configuracion",
     )
@@ -923,9 +666,8 @@ def main() -> None:
     finally:
         detener_relectura.set()
         detector.forzar_fin_evento()
-        # Ejecuta las escrituras pendientes (por ejemplo, el cierre del
-        # evento de arriba) antes de terminar el proceso.
-        registro_eventos.detener()
+        for accion in acciones:
+            accion.detener()
         sock_telemetria.close()
 
 

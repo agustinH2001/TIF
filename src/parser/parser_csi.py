@@ -1,36 +1,7 @@
-"""
-parser_csi.py
-=============
+"""Extracción de CSI desde capturas de Nexmon.
 
-Módulo de parsing y extracción de datos CSI (Channel State Information)
-a partir de archivos .pcap generados por el firmware Nexmon CSI en la
-Raspberry Pi (MVP 1).
-
-Formato de captura (Nexmon CSI):
-    - Las tramas CSI viajan encapsuladas como paquetes UDP con destino al
-      puerto 5500.
-    - Nexmon "marca" estas tramas usando, en la capa Ethernet simulada,
-      la dirección MAC de origen 4e:45:58:4d:4f:4e, que son los bytes
-      ASCII de la palabra "NEXMON". Esto permite distinguir tramas CSI
-      de cualquier otro tráfico que pudiera haber quedado en la captura.
-    - El payload UDP trae, primero, una cabecera interna fija de Nexmon
-      (magic bytes, RSSI, MAC de la trama Wi-Fi original, número de
-      secuencia, core/stream y chanspec) y, a continuación, los valores
-      crudos de CSI: pares consecutivos de enteros int16 con signo,
-      little-endian, correspondientes a la componente En-Fase (I) y en
-      Cuadratura (Q) de cada subportadora OFDM.
-
-Rol en el pipeline:
-    Este módulo es el primer eslabón del MVP 2. Su única responsabilidad
-    es transformar el .pcap crudo en una matriz de NumPy de amplitudes
-    (paquetes x subportadoras), lista para que el siguiente módulo
-    (procesamiento de señal / detección de movimiento) la consuma sin
-    tener que conocer nada sobre el formato de Nexmon ni de Scapy.
-
-Requisitos:
-    pip install scapy numpy
-
-Autor: Trabajo Integrador Final - Módulo Parser/Extractor CSI
+Cada trama CSI es un paquete UDP al puerto 5500 con MAC de origen 4e:45:58:4d:4f:4e;
+después de una cabecera de 18 bytes vienen los pares I/Q (int16) de cada subportadora.
 """
 
 import logging
@@ -41,64 +12,24 @@ import numpy as np
 from scapy.all import rdpcap, Ether, UDP, Raw
 from scapy.error import Scapy_Exception
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("parser_csi")
 
-# ---------------------------------------------------------------------------
-# Constantes del formato Nexmon CSI
-# ---------------------------------------------------------------------------
 
-# Puerto UDP donde Nexmon CSI vuelca las tramas con datos crudos de CSI.
 PUERTO_UDP_NEXMON = 5500
 
-# MAC "mágica" que Nexmon CSI utiliza como dirección de origen en la capa
-# Ethernet simulada, para poder distinguir tramas CSI del resto del
-# tráfico. Corresponde a los bytes ASCII de la palabra "NEXMON"
-# (4e 45 58 4d 4f 4e).
 MAC_MAGICA_NEXMON = "4e:45:58:4d:4f:4e"
 
-# Longitud (en bytes) de la cabecera interna fija que Nexmon antepone a
-# los valores I/Q dentro del payload UDP. Es el valor típicamente citado
-# en la documentación y en herramientas de la comunidad Nexmon CSI, pero
-# puede variar levemente según la versión de firmware/parche utilizada.
-#
-# IMPORTANTE: antes de usar esto con capturas reales del equipo, validar
-# este número con la función auxiliar `inspeccionar_payload_hex()` de
-# este mismo módulo (ver bloque main), comparando la longitud total del
-# payload contra la cantidad de subportadoras esperada según el ancho de
-# banda configurado (20MHz -> 64, 40MHz -> 128, 80MHz -> 256).
 LONGITUD_CABECERA_NEXMON = 18
 
-# Formato de cada valor I/Q: entero de 16 bits con signo, little-endian
-# (propio de los chipsets Broadcom/Cypress que soporta Nexmon).
 DTYPE_IQ = np.dtype("<i2")
 
 
-# ---------------------------------------------------------------------------
-# Resolución robusta de rutas
-# ---------------------------------------------------------------------------
 def _resolver_ruta_pcap(pcap_path: Optional[str] = None) -> Path:
-    """
-    Resuelve la ruta al archivo .pcap sin importar si el script se
-    ejecuta desde la raíz del proyecto o desde src/parser/.
-
-    Args:
-        pcap_path: ruta (absoluta o relativa) provista por el usuario.
-            Si es None, se usa por defecto 'data/raw/csi_test.pcap'
-            relativo a la raíz del proyecto.
-
-    Returns:
-        Path resuelto al archivo .pcap (puede no existir; la validación
-        de existencia se hace en `extraer_csi`).
-    """
-    # Este archivo vive en <raiz_proyecto>/src/parser/parser_csi.py,
-    # por lo que subir 2 niveles desde su ubicación da la raíz del proyecto.
+    """Devuelve la ruta del .pcap a usar (por defecto, data/raw/csi_test.pcap)."""
     raiz_proyecto = Path(__file__).resolve().parents[2]
 
     if pcap_path is None:
@@ -108,42 +39,21 @@ def _resolver_ruta_pcap(pcap_path: Optional[str] = None) -> Path:
     if ruta.is_absolute():
         return ruta
 
-    # 1) Probar relativo al directorio de trabajo actual (por si se
-    #    ejecuta "python parser_csi.py" parado en src/parser/).
     candidato_cwd = Path.cwd() / ruta
     if candidato_cwd.exists():
         return candidato_cwd
 
-    # 2) Si no existe ahí, probar relativo a la raíz del proyecto (por
-    #    si se ejecuta desde la raíz, ej. "python -m src.parser.parser_csi").
     return raiz_proyecto / ruta
 
 
-# ---------------------------------------------------------------------------
-# Filtrado y extracción por paquete
-# ---------------------------------------------------------------------------
 def _extraer_payload_csi(paquete) -> Optional[bytes]:
-    """
-    Filtra un paquete de Scapy y, si corresponde a una trama CSI de
-    Nexmon válida (UDP puerto 5500 + MAC de origen "NEXMON"), devuelve
-    los bytes crudos de datos I/Q (payload UDP sin la cabecera interna
-    de Nexmon).
-
-    Args:
-        paquete: paquete individual devuelto por `scapy.rdpcap`.
-
-    Returns:
-        bytes con los datos I/Q crudos, o None si el paquete no cumple
-        los criterios de filtrado (no es una trama CSI válida).
-    """
+    """Devuelve los bytes I/Q si el paquete es una trama CSI de Nexmon, o None."""
     if not (paquete.haslayer(Ether) and paquete.haslayer(UDP)):
         return None
 
-    # Filtro 1: puerto UDP de destino == 5500 (tramas CSI de Nexmon).
     if int(paquete[UDP].dport) != PUERTO_UDP_NEXMON:
         return None
 
-    # Filtro 2: MAC de origen "mágica" que marca las tramas Nexmon CSI.
     if paquete[Ether].src.lower() != MAC_MAGICA_NEXMON:
         return None
 
@@ -153,26 +63,13 @@ def _extraer_payload_csi(paquete) -> Optional[bytes]:
     payload_udp = bytes(paquete[Raw].load)
 
     if len(payload_udp) <= LONGITUD_CABECERA_NEXMON:
-        # El payload no tiene datos CSI reales más allá de la cabecera.
         return None
 
     return payload_udp[LONGITUD_CABECERA_NEXMON:]
 
 
 def _calcular_amplitud_fase(datos_iq: bytes) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convierte los bytes crudos de un paquete en pares (I, Q) y calcula,
-    de forma vectorizada con NumPy, la amplitud y la fase de cada
-    subportadora.
-
-    Args:
-        datos_iq: bytes con pares I,Q consecutivos (int16 little-endian).
-
-    Returns:
-        Tupla (amplitud, fase) como np.ndarray de float64. Ambos vacíos
-        si `datos_iq` no alcanza para al menos un par I/Q completo.
-    """
-    # Cada muestra (I o Q) ocupa 2 bytes; un par (I, Q) ocupa 4 bytes.
+    """Convierte los pares I/Q en amplitud y fase por subportadora."""
     n_pares = len(datos_iq) // 4
     if n_pares == 0:
         return np.array([]), np.array([])
@@ -190,22 +87,7 @@ def _calcular_amplitud_fase(datos_iq: bytes) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _apilar_con_longitud_consistente(lista_amplitudes: List[np.ndarray]) -> np.ndarray:
-    """
-    Apila los vectores de amplitud de cada paquete en una única matriz
-    (n_paquetes x n_subportadoras).
-
-    En una captura real puede haber paquetes truncados/corruptos con una
-    cantidad de subportadoras distinta a la mayoría. Para no romper el
-    armado de la matriz final, se conserva la longitud más frecuente
-    (moda) y se descartan los paquetes que no coincidan.
-
-    Args:
-        lista_amplitudes: lista de vectores de amplitud (uno por paquete).
-
-    Returns:
-        np.ndarray 2D con todos los vectores de amplitud de longitud
-        consistente apilados por filas.
-    """
+    """Apila los vectores de amplitud descartando los de longitud distinta a la mayoritaria."""
     longitudes = [a.shape[0] for a in lista_amplitudes]
     longitud_moda = max(set(longitudes), key=longitudes.count)
 
@@ -221,35 +103,8 @@ def _apilar_con_longitud_consistente(lista_amplitudes: List[np.ndarray]) -> np.n
     return np.vstack(filas_validas)
 
 
-# ---------------------------------------------------------------------------
-# Función principal del módulo
-# ---------------------------------------------------------------------------
 def extraer_csi(pcap_path: Optional[str] = None) -> np.ndarray:
-    """
-    Extrae la matriz de amplitudes CSI a partir de un archivo .pcap
-    capturado con Nexmon CSI.
-
-    Pipeline de extracción:
-        1. Abre el .pcap con Scapy y filtra únicamente los paquetes UDP
-           con destino al puerto 5500 y MAC de origen "NEXMON".
-        2. De cada paquete válido, descarta la cabecera interna fija de
-           Nexmon y extrae los pares (I, Q) como enteros int16 con signo.
-        3. Calcula la amplitud de cada subportadora de forma vectorizada:
-           A = sqrt(I^2 + Q^2).
-        4. Apila las amplitudes de todos los paquetes válidos en una
-           matriz (n_paquetes x n_subportadoras).
-
-    Args:
-        pcap_path: ruta al archivo .pcap. Si es None, se usa por defecto
-            'data/raw/csi_test.pcap' relativo a la raíz del proyecto.
-
-    Returns:
-        np.ndarray de forma (n_paquetes, n_subportadoras) con las
-        amplitudes CSI (float64), listo para el siguiente módulo del
-        pipeline. Devuelve un array vacío de forma (0, 0) si el archivo
-        no existe, está vacío, está corrupto, o no contiene ningún
-        paquete CSI válido.
-    """
+    """Lee un .pcap y devuelve la matriz de amplitudes (paquetes x subportadoras)."""
     ruta = _resolver_ruta_pcap(pcap_path)
 
     if not ruta.exists():
@@ -266,7 +121,6 @@ def extraer_csi(pcap_path: Optional[str] = None) -> np.ndarray:
         logger.error(f"Error al leer el archivo .pcap '{ruta}': {e}")
         return np.empty((0, 0))
     except Exception as e:
-        # Cubre errores de bajo nivel (archivo corrupto, formato inválido, etc.)
         logger.error(f"Error inesperado al leer '{ruta}': {e}")
         return np.empty((0, 0))
 
@@ -279,7 +133,7 @@ def extraer_csi(pcap_path: Optional[str] = None) -> np.ndarray:
     for paquete in paquetes:
         datos_iq = _extraer_payload_csi(paquete)
         if datos_iq is None:
-            continue  # paquete descartado: no es una trama CSI válida
+            continue
 
         amplitud, _fase = _calcular_amplitud_fase(datos_iq)
         if amplitud.size > 0:
@@ -301,21 +155,8 @@ def extraer_csi(pcap_path: Optional[str] = None) -> np.ndarray:
     return matriz_amplitud
 
 
-# ---------------------------------------------------------------------------
-# Utilidad de diagnóstico (no forma parte del pipeline de producción)
-# ---------------------------------------------------------------------------
 def inspeccionar_payload_hex(pcap_path: Optional[str] = None, n_paquetes: int = 1) -> None:
-    """
-    Imprime en hexadecimal el payload UDP crudo de los primeros paquetes
-    CSI encontrados en el .pcap. Es una herramienta de diagnóstico para
-    validar/ajustar manualmente `LONGITUD_CABECERA_NEXMON` contra una
-    captura real (por ejemplo, ubicando visualmente dónde terminan los
-    campos de cabecera y empiezan los pares I/Q).
-
-    Args:
-        pcap_path: ruta al .pcap a inspeccionar (ver `extraer_csi`).
-        n_paquetes: cantidad de paquetes CSI a mostrar.
-    """
+    """Imprime en hexadecimal los primeros paquetes CSI (diagnóstico)."""
     ruta = _resolver_ruta_pcap(pcap_path)
     if not ruta.exists():
         print(f"El archivo .pcap no existe: {ruta}")
@@ -346,11 +187,8 @@ def inspeccionar_payload_hex(pcap_path: Optional[str] = None, n_paquetes: int = 
         print("No se encontraron paquetes CSI válidos para inspeccionar.")
 
 
-# ---------------------------------------------------------------------------
-# Prueba manual del módulo
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    ruta_prueba = _resolver_ruta_pcap()  # data/raw/csi_test.pcap por defecto
+    ruta_prueba = _resolver_ruta_pcap()
     print(f"Buscando archivo de prueba en: {ruta_prueba}")
 
     matriz_amplitud = extraer_csi(str(ruta_prueba))
