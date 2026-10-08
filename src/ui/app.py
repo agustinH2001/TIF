@@ -8,7 +8,8 @@ from typing import Optional
 import customtkinter as ctk
 
 from src.common.telemetria_ipc import HOST_TELEMETRIA, PUERTO_TELEMETRIA
-from src.ui.componentes import ReceptorTelemetria, etiqueta, icono
+from src.database.database import establecer_usuario_activo
+from src.ui.componentes import ReceptorTelemetria, en_hilo, etiqueta, icono
 from src.ui.configuracion import PantallaConfiguracion
 from src.ui.diagnostico import PantallaDiagnostico
 from src.ui.historial import PantallaHistorial
@@ -36,7 +37,9 @@ class VistaPrincipal(ctk.CTkFrame):
         super().__init__(master, fg_color=COLORES["fondo"], corner_radius=0)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.usuario_id = usuario_id
         self._ultima_muestra: Optional[datetime] = None
+        self._ultima_muestra_ajena: Optional[datetime] = None
         self._fs: Optional[float] = None
         self._activa = True
 
@@ -145,6 +148,14 @@ class VistaPrincipal(ctk.CTkFrame):
     def _distribuir(self, muestra: dict) -> None:
         if not self._activa:
             return
+        # main.py corriendo para otra cuenta: no se muestran sus datos como propios
+        usuario_sensor = muestra.get("usuario_id")
+        if usuario_sensor is not None and usuario_sensor != self.usuario_id:
+            otro_antes = self._sensor_de_otro_usuario()
+            self._ultima_muestra_ajena = datetime.now()
+            if not otro_antes:
+                self._actualizar_sensor()
+            return
         estaba_en_linea = self._sensor_en_linea()
         self._ultima_muestra = datetime.now()
         self._fs = muestra.get("fs_estimada")
@@ -157,13 +168,24 @@ class VistaPrincipal(ctk.CTkFrame):
         return (self._ultima_muestra is not None
                 and (datetime.now() - self._ultima_muestra).total_seconds() <= SEGUNDOS_SIN_TELEMETRIA)
 
+    def _sensor_de_otro_usuario(self) -> bool:
+        return (not self._sensor_en_linea() and self._ultima_muestra_ajena is not None
+                and (datetime.now() - self._ultima_muestra_ajena).total_seconds() <= SEGUNDOS_SIN_TELEMETRIA)
+
     def _actualizar_sensor(self) -> None:
         en_linea = self._sensor_en_linea()
+        de_otro = self._sensor_de_otro_usuario()
+        if en_linea:
+            color, texto = COLORES["ok"], "Sensor en línea"
+        elif de_otro:
+            color, texto = COLORES["aviso"], "Sensor en uso por otro usuario"
+        else:
+            color, texto = COLORES["sin_datos"], "Sensor sin datos"
         self.punto.delete("all")
-        self.punto.create_oval(1, 1, 9, 9, outline="", fill=COLORES["ok"] if en_linea else COLORES["sin_datos"])
-        self.label_sensor.configure(text="Sensor en línea" if en_linea else "Sensor sin datos")
+        self.punto.create_oval(1, 1, 9, 9, outline="", fill=color)
+        self.label_sensor.configure(text=texto)
         self.label_fs.configure(text=f"{self._fs:.0f} Hz" if en_linea and self._fs else "")
-        self.pantallas["Inicio"].set_sensor_en_linea(en_linea)
+        self.pantallas["Inicio"].set_sensor_en_linea(en_linea, de_otro_usuario=de_otro)
 
     def _tick(self) -> None:
         if not self._activa:
@@ -205,6 +227,8 @@ class DashboardApp(ctk.CTk):
 
     def _on_login_exitoso(self, usuario_id: int, usuario: str) -> None:
         logger.info(f"Sesión iniciada: '{usuario}' (usuario_id={usuario_id}).")
+        # El sensor (main.py) pasa a registrar para quien inició sesión
+        en_hilo(self, establecer_usuario_activo, lambda _ok: None, usuario_id)
         self._cambiar_vista(VistaPrincipal(self, usuario_id, usuario, on_cerrar_sesion=self._mostrar_login))
 
     def _on_cerrar(self) -> None:

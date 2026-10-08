@@ -69,7 +69,9 @@ class RegistroEventosAsincrono:
             logger.info("Evento no guardado: el registro de eventos está desactivado.")
             return
         self._eventos_abiertos.add(id_evento)
-        self._encolar(("inicio", id_evento, inicio, varianza))
+        # El usuario viaja con el pedido: si el sensor cambia de usuario antes de que
+        # se escriba, el evento igual queda a nombre de quien estaba activo
+        self._encolar(("inicio", id_evento, inicio, varianza, self.usuario_id))
 
     def al_finalizar(
         self, id_evento: int, inicio: datetime, fin: datetime, duracion: float,
@@ -102,9 +104,9 @@ class RegistroEventosAsincrono:
     def _ejecutar(self, pedido: tuple) -> None:
         tipo, id_evento = pedido[0], pedido[1]
         if tipo == "inicio":
-            _, _, inicio, varianza = pedido
+            _, _, inicio, varianza, usuario_id = pedido
             id_base = self._insertar(
-                usuario_id=self.usuario_id,
+                usuario_id=usuario_id,
                 varianza=varianza,
                 duracion=None,
                 timestamp_inicio=inicio,

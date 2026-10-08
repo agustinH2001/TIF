@@ -407,10 +407,10 @@ class DetectorMovimiento:
             except Exception as e:
                 logger.error(f"Error en la acción {type(accion).__name__}.{metodo}: {e}")
 
-    def forzar_fin_evento(self) -> None:
+    def forzar_fin_evento(self, motivo: str = "fin del stream") -> None:
         """Cierra el evento en curso, si hay uno (por ejemplo, al cortarse el stream)."""
         if self._en_movimiento:
-            logger.info("Se cierra el evento de movimiento en curso por fin del stream.")
+            logger.info(f"Se cierra el evento de movimiento en curso por {motivo}.")
             self._finalizar_evento(self._reloj())
         else:
             self.reiniciar_estado()

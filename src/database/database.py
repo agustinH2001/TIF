@@ -471,6 +471,83 @@ def registrar_ruta_archivo(
         _cerrar(cursor, conexion)
 
 
+SQL_TABLA_SENSOR_ACTIVO = (
+    "CREATE TABLE sensor_activo (id TINYINT NOT NULL PRIMARY KEY DEFAULT 1, usuario_id INT NULL, "
+    "actualizado TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, "
+    "FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL);"
+)
+
+
+class TablaSensorInexistente(RuntimeError):
+    """Falta la tabla sensor_activo en la base."""
+
+
+def _error_tabla_sensor(e: Error) -> None:
+    if getattr(e, "errno", None) == 1146:  # ER_NO_SUCH_TABLE
+        raise TablaSensorInexistente(
+            f"Falta la tabla sensor_activo. Creala en phpMyAdmin con: {SQL_TABLA_SENSOR_ACTIVO}"
+        ) from e
+
+
+def establecer_usuario_activo(usuario_id: int) -> bool:
+    """Indica para qué usuario tiene que registrar el sensor (lo llama el Dashboard al iniciar sesión)."""
+    conexion = conectar_db()
+    if conexion is None:
+        return False
+
+    cursor = None
+    try:
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            INSERT INTO sensor_activo (id, usuario_id) VALUES (1, %s)
+            ON DUPLICATE KEY UPDATE usuario_id = VALUES(usuario_id)
+            """,
+            (usuario_id,),
+        )
+        conexion.commit()
+        return True
+
+    except Error as e:
+        conexion.rollback()
+        if getattr(e, "errno", None) == 1146:
+            logger.error(f"Falta la tabla sensor_activo. Creala con: {SQL_TABLA_SENSOR_ACTIVO}")
+        else:
+            logger.error(f"Error al establecer el usuario activo del sensor: {e}")
+        return False
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def obtener_usuario_activo() -> Optional[Dict[str, Any]]:
+    """Devuelve {usuario_id, username} del usuario activo del sensor, o None si no hay.
+
+    Lanza TablaSensorInexistente si la tabla no fue creada.
+    """
+    conexion = conectar_db()
+    if conexion is None:
+        return None
+
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT s.usuario_id, u.username
+            FROM sensor_activo s JOIN usuarios u ON u.id = s.usuario_id
+            WHERE s.id = 1
+            """
+        )
+        return cursor.fetchone()
+
+    except Error as e:
+        _error_tabla_sensor(e)
+        logger.error(f"Error al obtener el usuario activo del sensor: {e}")
+        return None
+    finally:
+        _cerrar(cursor, conexion)
+
+
 def obtener_configuracion_usuario(usuario_id: int) -> Optional[Dict[str, Any]]:
     """Devuelve {usuario_id, umbral_sensibilidad, guardar_eventos, enviar_alertas} o None."""
     conexion = conectar_db()

@@ -40,6 +40,7 @@ class PantallaInicio(ctk.CTkFrame):
         self._movimiento_vivo = False
         self._inicio_vivo: Optional[datetime] = None
         self._sensor_en_linea = False
+        self._sensor_de_otro_usuario = False
         self._ultimo_evento: Optional[dict] = None
         self._config: Optional[dict] = None
         self._eventos_24h: list = []
@@ -111,7 +112,11 @@ class PantallaInicio(ctk.CTkFrame):
             self._dibujar_24h()
         self._dibujar_traza()
 
-    def set_sensor_en_linea(self, en_linea: bool) -> None:
+    def set_sensor_en_linea(self, en_linea: bool, de_otro_usuario: bool = False) -> None:
+        cambio_otro = de_otro_usuario != self._sensor_de_otro_usuario
+        self._sensor_de_otro_usuario = de_otro_usuario
+        if cambio_otro and not en_linea:
+            self._actualizar_estado()
         if en_linea != self._sensor_en_linea:
             self._sensor_en_linea = en_linea
             if not en_linea:
@@ -175,7 +180,11 @@ class PantallaInicio(ctk.CTkFrame):
             self.label_historial.configure(
                 text="Guardando en el historial" if self._config["guardar_eventos"] else "Historial desactivado")
 
-        if not self._sensor_en_linea:
+        if not self._sensor_en_linea and self._sensor_de_otro_usuario:
+            titulo, color, franja = "Sensor en uso por otro usuario", COLORES["texto_suave"], "transparent"
+            detalle = ("El sensor está registrando para otra cuenta. Si acabás de iniciar sesión, "
+                       "cambia solo en unos segundos; si no, main.py se inició con un usuario fijo (--usuario).")
+        elif not self._sensor_en_linea:
             titulo, color = "Sin datos del sensor", COLORES["texto_suave"]
             detalle = "Revisá que main.py esté corriendo y que la Raspberry Pi esté enviando la captura."
             franja = "transparent"

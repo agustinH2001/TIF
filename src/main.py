@@ -1,10 +1,12 @@
 """Programa principal: recibe en vivo el stream pcap de la Raspberry Pi por TCP,
 arma ventanas de 2 s, detecta movimiento y publica telemetría para el Dashboard.
 
-Uso: python -m src.main [--verbose]
+Uso: python -m src.main [--usuario NOMBRE] [--verbose]
+Sin --usuario, registra para el último usuario que inició sesión en el Dashboard.
 """
 
 import argparse
+import getpass
 import logging
 import socket
 import struct
@@ -23,7 +25,9 @@ if str(RAIZ_PROYECTO) not in sys.path:
     sys.path.insert(0, str(RAIZ_PROYECTO))
 
 from src.database.database import (
+    TablaSensorInexistente,
     cerrar_eventos_abiertos,
+    obtener_usuario_activo,
     obtener_configuracion_usuario,
     verificar_usuario,
 )
@@ -47,8 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-USERNAME_DEMO = "agustin_test"
-PASSWORD_DEMO = "Formosa2026!"
+INTENTOS_LOGIN = 3
 
 HOST = "0.0.0.0"
 PORT = 9999
@@ -78,27 +81,35 @@ INTERVALO_RECORDATORIO_SIN_FILTRO_SEG = 10.0
 # Cada cuántas ventanas se relee la configuración (~5 s)
 BLOQUES_ENTRE_RELECTURAS_CONFIG = 25
 
-TIMEOUT_ESPERA_RELECTURA_SEG = 10.0
+TIMEOUT_ESPERA_RELECTURA_SEG = 3.0
+
+# Sin --usuario: cada cuánto se consulta si alguien inició sesión en el Dashboard
+INTERVALO_ESPERA_USUARIO_SEG = 3.0
 
 
 class ErrorProtocoloPcap(Exception):
     """El stream no respeta el formato pcap."""
 
 
-def autenticar_usuario() -> Optional[int]:
-    """Inicia sesión con el usuario configurado. Devuelve el id o None."""
-    logger.info(f"Autenticando usuario '{USERNAME_DEMO}'...")
-    usuario_id = verificar_usuario(USERNAME_DEMO, PASSWORD_DEMO)
+def autenticar_usuario(usuario: Optional[str]) -> Optional[Tuple[int, str]]:
+    """Pide la contraseña (y el usuario si no se indicó) en la terminal.
 
-    if usuario_id is None:
+    Devuelve (usuario_id, usuario) o None tras INTENTOS_LOGIN intentos fallidos.
+    """
+    for intento in range(1, INTENTOS_LOGIN + 1):
+        nombre = usuario or input("Usuario: ").strip()
+        contrasenia = getpass.getpass(f"Contraseña de '{nombre}': ")
+        usuario_id = verificar_usuario(nombre, contrasenia)
+        if usuario_id is not None:
+            logger.info(f"Sesión iniciada como '{nombre}' (usuario_id={usuario_id}).")
+            return usuario_id, nombre
+        restantes = INTENTOS_LOGIN - intento
         logger.error(
-            f"Autenticación fallida para '{USERNAME_DEMO}'. Verificá que XAMPP/MySQL "
-            f"esté corriendo y que el usuario exista en csi_db.usuarios."
+            "Usuario o contraseña incorrectos"
+            + (f" (quedan {restantes} intento{'s' if restantes != 1 else ''})." if restantes else ".")
+            + " Si el error persiste, verificá que MySQL esté corriendo."
         )
-        return None
-
-    logger.info(f"Autenticación exitosa. usuario_id={usuario_id}")
-    return usuario_id
+    return None
 
 
 def cargar_configuracion(usuario_id: int) -> Optional[dict]:
@@ -117,15 +128,54 @@ def cargar_configuracion(usuario_id: int) -> Optional[dict]:
     return config
 
 
+class SesionSensor:
+    """Usuario para el que registra el sensor y cambio de usuario pendiente.
+
+    El cambio lo detecta el hilo de relectura, pero se aplica en el hilo que procesa las
+    ventanas (aplicar_cambio_pendiente), para no tocar el detector desde dos hilos.
+    """
+
+    def __init__(self, usuario_id: int, nombre: str, fijo: bool) -> None:
+        self.usuario_id = usuario_id
+        self.nombre = nombre
+        self.fijo = fijo  # True con --usuario: no sigue al Dashboard
+        self.pendiente: Optional[Tuple[int, str, dict]] = None
+        self.detector: Optional[DetectorMovimiento] = None
+        self.registro: Optional[RegistroEventosAsincrono] = None
+        self.notificador: Optional[NotificadorWindows] = None
+
+    def aplicar_config(self, config: dict) -> None:
+        self.detector.umbral_sensibilidad = config["umbral_sensibilidad"]
+        self.registro.habilitada = config["guardar_eventos"]
+        self.notificador.habilitada = config["enviar_alertas"]
+
+    def aplicar_cambio_pendiente(self) -> None:
+        pendiente = self.pendiente
+        if pendiente is None:
+            return
+        self.pendiente = None
+        usuario_id, nombre, config = pendiente
+        # El movimiento en curso queda a nombre del usuario anterior
+        self.detector.forzar_fin_evento(motivo="cambio de usuario")
+        self.usuario_id, self.nombre = usuario_id, nombre
+        self.detector.usuario_id = usuario_id
+        self.registro.usuario_id = usuario_id
+        self.aplicar_config(config)
+        logger.info(
+            f"Ahora el sensor registra para '{nombre}' (usuario_id={usuario_id}): "
+            f"umbral={config['umbral_sensibilidad']}, guardar eventos="
+            f"{'sí' if config['guardar_eventos'] else 'no'}, alertas="
+            f"{'sí' if config['enviar_alertas'] else 'no'}."
+        )
+
+
 def _hilo_relectura_configuracion(
-    usuario_id: int,
-    detector: DetectorMovimiento,
-    registro_eventos: RegistroEventosAsincrono,
-    notificador: NotificadorWindows,
+    sesion: SesionSensor,
     evento_relectura: threading.Event,
     detener_evento: threading.Event,
 ) -> None:
-    """Relee la configuración periódicamente y aplica los cambios hechos desde el Dashboard."""
+    """Relee periódicamente el usuario activo y su configuración, y aplica los cambios."""
+    detector, registro_eventos, notificador = sesion.detector, sesion.registro, sesion.notificador
     while not detener_evento.is_set():
         disparado_por_bloques = evento_relectura.wait(timeout=TIMEOUT_ESPERA_RELECTURA_SEG)
         if detener_evento.is_set():
@@ -133,7 +183,28 @@ def _hilo_relectura_configuracion(
         if disparado_por_bloques:
             evento_relectura.clear()
 
-        config = obtener_configuracion_usuario(usuario_id)
+        if not sesion.fijo:
+            try:
+                activo = obtener_usuario_activo()
+            except TablaSensorInexistente as e:
+                logger.error(str(e))
+                activo = None
+            objetivo = sesion.pendiente[0] if sesion.pendiente else sesion.usuario_id
+            if activo is not None and activo["usuario_id"] != objetivo:
+                nuevo_id, nuevo_nombre = activo["usuario_id"], activo["username"]
+                config_nueva = obtener_configuracion_usuario(nuevo_id)
+                if config_nueva is not None:
+                    cerrar_eventos_abiertos(nuevo_id)
+                    logger.info(
+                        f"Se inició sesión en el Dashboard como '{nuevo_nombre}': el sensor "
+                        f"cambia de usuario en la próxima ventana."
+                    )
+                    sesion.pendiente = (nuevo_id, nuevo_nombre, config_nueva)
+                continue
+        if sesion.pendiente is not None:
+            continue  # la configuración nueva se aplica junto con el cambio de usuario
+
+        config = obtener_configuracion_usuario(sesion.usuario_id)
         if config is None:
             logger.warning(
                 "Relectura de configuración: no se pudo consultar la BD "
@@ -171,6 +242,7 @@ def _enviar_telemetria(
     resultado: dict,
     fs_estimada: Optional[float],
     umbral_actual: float,
+    usuario_id: int,
 ) -> None:
     """Envía por UDP los datos de la ventana al Dashboard."""
     payload = serializar_muestra(
@@ -186,6 +258,7 @@ def _enviar_telemetria(
         ventanas_sobre_umbral=resultado["ventanas_sobre_umbral"],
         ventanas_confirmacion=resultado["ventanas_confirmacion"],
         umbral_salida=resultado["umbral_salida"],
+        usuario_id=usuario_id,
     )
     try:
         sock_telemetria.send(payload)
@@ -328,7 +401,7 @@ class ResumenPeriodico:
 
 def _procesar_stream(
     conexion: socket.socket,
-    detector: DetectorMovimiento,
+    sesion: SesionSensor,
     sock_telemetria: socket.socket,
     evento_relectura: threading.Event,
 ) -> None:
@@ -408,14 +481,15 @@ def _procesar_stream(
                 momento_ultimo_aviso_lento = ahora
             continue
 
+        sesion.aplicar_cambio_pendiente()
         resultado, fs_estimada = _procesar_ventana_completa(
-            buffer_ventana, detector, sock_telemetria, n_paquetes_csi, n_paquetes_descartados
+            buffer_ventana, sesion.detector, sock_telemetria, n_paquetes_csi, n_paquetes_descartados
         )
         momento_inicio_espera = time.time()
         momento_ultimo_aviso_lento = None
 
         resumen.registrar(resultado, fs_estimada)
-        resumen.emitir_si_corresponde(detector, resultado["movimiento_detectado"])
+        resumen.emitir_si_corresponde(sesion.detector, resultado["movimiento_detectado"])
 
         estado_filtro = resultado["estado_filtro"]
         ahora = time.time()
@@ -505,7 +579,9 @@ def _procesar_ventana_completa(
         f"paquetes_csi_totales={n_paquetes_csi} | descartados={n_paquetes_descartados}"
     )
 
-    _enviar_telemetria(sock_telemetria, resultado, fs_estimada, detector.umbral_sensibilidad)
+    _enviar_telemetria(
+        sock_telemetria, resultado, fs_estimada, detector.umbral_sensibilidad, detector.usuario_id
+    )
     return resultado, fs_estimada
 
 
@@ -542,7 +618,7 @@ def _imprimir_instrucciones_raspberry_pi() -> None:
 
 
 def _ejecutar_servidor(
-    detector: DetectorMovimiento,
+    sesion: SesionSensor,
     sock_telemetria: socket.socket,
     evento_relectura: threading.Event,
 ) -> None:
@@ -562,7 +638,7 @@ def _ejecutar_servidor(
             logger.info(f"Raspberry Pi conectada desde {direccion[0]}:{direccion[1]}.")
 
             try:
-                _procesar_stream(conexion, detector, sock_telemetria, evento_relectura)
+                _procesar_stream(conexion, sesion, sock_telemetria, evento_relectura)
             except (socket.timeout, TimeoutError):
                 logger.warning(
                     f"No llegaron datos en {TIMEOUT_INACTIVIDAD_SEG:.0f}s: se asume que "
@@ -572,14 +648,32 @@ def _ejecutar_servidor(
                 logger.warning(f"Conexión con la Raspberry Pi interrumpida: {e}")
             finally:
                 # Si se corta el stream durante un movimiento, se cierra el evento
-                detector.forzar_fin_evento()
+                sesion.detector.forzar_fin_evento()
                 conexion.close()
                 logger.info("Conexión cerrada. Esperando una nueva conexión...\n")
+
+
+def _esperar_usuario_activo() -> dict:
+    """Espera a que alguien inicie sesión en el Dashboard. Devuelve {usuario_id, username}."""
+    avisado = False
+    while True:
+        activo = obtener_usuario_activo()
+        if activo is not None:
+            return activo
+        if not avisado:
+            logger.info("Esperando a que alguien inicie sesión en el Dashboard...")
+            avisado = True
+        time.sleep(INTERVALO_ESPERA_USUARIO_SEG)
 
 
 def _parsear_argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Orquestador en vivo del sistema de detección de movimiento por CSI Wi-Fi."
+    )
+    parser.add_argument(
+        "-u", "--usuario",
+        help="Fija el usuario para el que se registran los movimientos (pide la contraseña). "
+             "Si se omite, el sensor registra para quien inicie sesión en el Dashboard.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -603,9 +697,26 @@ def main() -> None:
     print(" Orquestador principal (src/main.py) - MODO EN VIVO (streaming TCP)")
     print("=" * 72)
 
-    usuario_id = autenticar_usuario()
-    if usuario_id is None:
-        sys.exit(1)
+    if argumentos.usuario:
+        autenticado = autenticar_usuario(argumentos.usuario)
+        if autenticado is None:
+            sys.exit(1)
+        sesion = SesionSensor(*autenticado, fijo=True)
+    else:
+        try:
+            activo = _esperar_usuario_activo()
+        except TablaSensorInexistente as e:
+            logger.error(f"{e} También podés fijar un usuario con --usuario.")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            logger.info("Cancelado (Ctrl+C).")
+            sys.exit(0)
+        sesion = SesionSensor(activo["usuario_id"], activo["username"], fijo=False)
+        logger.info(
+            f"El sensor registra para '{sesion.nombre}', el último usuario que inició sesión en el "
+            f"Dashboard. Si entra otro usuario, el sensor cambia solo."
+        )
+    usuario_id = sesion.usuario_id
 
     config = cargar_configuracion(usuario_id)
     if config is None:
@@ -632,6 +743,7 @@ def main() -> None:
         frecuencia_muestreo=FRECUENCIA_MUESTREO_DEFAULT_HZ,
         acciones=acciones,
     )
+    sesion.detector, sesion.registro, sesion.notificador = detector, registro_eventos, notificador
     logger.info(
         f"Detector listo: umbral={config['umbral_sensibilidad']}, "
         f"fs mínima={FS_MINIMA_CONFIABLE_HZ:.0f} Hz, "
@@ -650,14 +762,14 @@ def main() -> None:
     detener_relectura = threading.Event()
     hilo_relectura = threading.Thread(
         target=_hilo_relectura_configuracion,
-        args=(usuario_id, detector, registro_eventos, notificador, evento_relectura, detener_relectura),
+        args=(sesion, evento_relectura, detener_relectura),
         daemon=True,
         name="relectura-configuracion",
     )
     hilo_relectura.start()
 
     try:
-        _ejecutar_servidor(detector, sock_telemetria, evento_relectura)
+        _ejecutar_servidor(sesion, sock_telemetria, evento_relectura)
     except KeyboardInterrupt:
         logger.info("Servidor detenido manualmente (Ctrl+C). Cerrando.")
     except OSError as e:
