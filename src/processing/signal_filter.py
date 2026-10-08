@@ -16,9 +16,12 @@ el pipeline de procesamiento de señal que decide si hubo movimiento:
     3. Evaluación de un trigger por umbral sobre esa métrica — SÓLO si
        la ventana pudo filtrarse. Una ventana sin filtrar no es
        comparable contra el umbral (ver "Ventanas inválidas" abajo).
-    4. Persistencia del evento en la base de datos, únicamente en el
-       flanco ascendente de la detección (False -> True), para no
-       duplicar el mismo evento de movimiento en cada ventana analizada.
+    4. Ciclo de vida del evento de movimiento: inicio al confirmarse
+       (flanco ascendente) y fin al volver a reposo, con duración real y
+       varianza máxima de todo el evento. La escritura en la base la
+       hace un objeto "registro de eventos" inyectado (ver
+       src/database/registro_eventos.py), normalmente en un hilo de
+       background, para no frenar nunca la captura en vivo.
 
 Ventanas inválidas (instrumentación del fallback):
     En pruebas en vivo con tráfico generado por `ping` (fs real de 2 a
@@ -41,11 +44,10 @@ Diseño modular:
     Las funciones de procesamiento de señal (`filtrar_señal_butterworth`,
     `calcular_varianza_promedio`, `evaluar_trigger_movimiento`) son puras:
     no dependen de la base de datos ni tienen efectos secundarios, y por
-    lo tanto son fácilmente testeables de forma aislada. La integración
-    con la persistencia (requisito 4) vive exclusivamente en la clase
-    `DetectorMovimiento`, que es la única responsable de manejar el
-    estado entre ventanas sucesivas (necesario para detectar el flanco
-    ascendente) e invocar `insertar_evento_movimiento`.
+    lo tanto son fácilmente testeables de forma aislada. Este módulo ya
+    NO importa la capa de datos: `DetectorMovimiento` recibe un objeto
+    con los métodos `registrar_inicio` / `registrar_fin` y sólo le avisa
+    cuándo empieza y termina cada evento.
 
 Requisitos:
     pip install numpy scipy
@@ -54,30 +56,12 @@ Autor: Trabajo Integrador Final - Módulo de Procesamiento de Señal (MVP 2)
 """
 
 import logging
-from typing import Optional, Tuple
+from datetime import datetime
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import median_filter
 from scipy.signal import butter, sosfiltfilt
-
-# ---------------------------------------------------------------------------
-# Import robusto de la capa de persistencia
-# ---------------------------------------------------------------------------
-# Se intenta primero el import absoluto normal (funciona si el proyecto se
-# ejecuta como paquete, ej. "python -m src.processing.signal_filter" desde
-# la raíz, o si la raíz del proyecto ya está en PYTHONPATH). Si falla
-# (por ejemplo al correr "python src/processing/signal_filter.py" de forma
-# standalone), se agrega la raíz del proyecto a sys.path y se reintenta.
-try:
-    from src.database.database import insertar_evento_movimiento
-except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
-
-    _raiz_proyecto = Path(__file__).resolve().parents[2]
-    if str(_raiz_proyecto) not in sys.path:
-        sys.path.insert(0, str(_raiz_proyecto))
-    from src.database.database import insertar_evento_movimiento
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -562,7 +546,7 @@ class DetectorMovimiento:
     Una ventana sobre el umbral que todavía no completó la racha de
     entrada queda como "candidata" (se informa en el resultado para que
     el Dashboard pueda mostrar "Confirmando 1/3..."), pero no cambia el
-    estado ni toca la base de datos.
+    estado ni genera un evento.
 
     Se implementa como clase (y no como función suelta) porque necesita
     recordar el estado y las rachas entre llamadas sucesivas de
@@ -587,6 +571,9 @@ class DetectorMovimiento:
         ventanas_confirmacion_entrada: int = VENTANAS_CONFIRMACION_ENTRADA_DEFAULT,
         ventanas_confirmacion_salida: int = VENTANAS_CONFIRMACION_SALIDA_DEFAULT,
         factor_histeresis: float = FACTOR_HISTERESIS_DEFAULT,
+        registro_eventos=None,
+        persistir_eventos: bool = True,
+        reloj: Callable[[], datetime] = datetime.now,
     ) -> None:
         """
         Args:
@@ -607,6 +594,19 @@ class DetectorMovimiento:
                 el umbral de salida necesarias para volver a reposo.
             factor_histeresis: umbral de salida = umbral * este factor
                 (entre 0 y 1).
+            registro_eventos: objeto con `registrar_inicio(timestamp,
+                varianza) -> token` y `registrar_fin(token, timestamp_fin,
+                duracion, varianza_maxima)` (ver
+                src/database/registro_eventos.py). Si es None, los eventos
+                sólo se informan en el log (útil para pruebas).
+            persistir_eventos: si los eventos se entregan al registro
+                (opción "Guardar eventos" de la configuración). Se puede
+                cambiar en caliente; se evalúa al INICIO de cada evento,
+                así un evento ya abierto siempre se cierra en la base
+                aunque la opción se desactive mientras dura.
+            reloj: función que devuelve la hora actual. Inyectable para
+                pruebas; por defecto `datetime.now` (hora local, la misma
+                que usa MySQL en XAMPP sobre la misma PC).
         """
         self.usuario_id = usuario_id
         self.umbral_sensibilidad = umbral_sensibilidad
@@ -630,6 +630,20 @@ class DetectorMovimiento:
         # Paquetes atípicos reemplazados en la última ventana (diagnóstico).
         self._ultimo_n_atipicos: int = 0
 
+        # --- Ciclo de vida del evento en curso -------------------------
+        self.registro_eventos = registro_eventos
+        self.persistir_eventos = bool(persistir_eventos)
+        self._reloj = reloj
+        # Hora de la PRIMERA ventana de la racha de entrada actual: es el
+        # inicio real del movimiento (la confirmación llega ~0.4 s después).
+        self._inicio_racha: Optional[datetime] = None
+        # Hora de la primera ventana de la racha de salida actual: es el
+        # fin del movimiento (la salida se confirma ~0.8 s después).
+        self._inicio_racha_salida: Optional[datetime] = None
+        self._inicio_evento: Optional[datetime] = None
+        self._varianza_maxima_evento: float = 0.0
+        self._token_evento: Optional[int] = None
+
     @property
     def umbral_salida(self) -> float:
         """Umbral por debajo del cual se cuenta una ventana para volver a reposo."""
@@ -640,7 +654,7 @@ class DetectorMovimiento:
     ) -> dict:
         """
         Ejecuta el pipeline completo sobre una ventana de amplitudes CSI
-        y, si corresponde, registra el evento en la base de datos.
+        y, si corresponde, abre o cierra el evento de movimiento.
 
         Args:
             matriz_amplitud: matriz (n_paquetes, n_subportadoras) de
@@ -667,7 +681,9 @@ class DetectorMovimiento:
                   `filtro_aplicado`, o de la señal CRUDA en caso
                   contrario (sólo informativa, no comparable).
                 - "evento_registrado" (bool): True si esta ventana
-                  confirmó un movimiento nuevo y el evento se persistió.
+                  confirmó un movimiento nuevo y el evento se entregó al
+                  registro de eventos (la escritura en la base es
+                  asíncrona).
                 - "frecuencia_muestreo_usada" (float): la fs que se usó
                   para diseñar (o intentar diseñar) el filtro.
                 - "filtro_aplicado" (bool): True si la ventana pasó por
@@ -719,6 +735,8 @@ class DetectorMovimiento:
         if not self._en_movimiento:
             # --- REPOSO: acumular racha de entrada ---------------------
             if supera_umbral:
+                if self._racha_sobre_umbral == 0:
+                    self._inicio_racha = self._reloj()
                 self._racha_sobre_umbral += 1
                 self._varianza_maxima_racha = max(self._varianza_maxima_racha, varianza_promedio)
             else:
@@ -733,61 +751,87 @@ class DetectorMovimiento:
                     )
                 self._racha_sobre_umbral = 0
                 self._varianza_maxima_racha = 0.0
+                self._inicio_racha = None
 
             if self._racha_sobre_umbral >= self.ventanas_confirmacion_entrada:
                 # Flanco ascendente del estado CONFIRMADO: único momento
-                # en el que se persiste un evento nuevo.
+                # en el que se crea un evento nuevo.
                 self._en_movimiento = True
                 self._racha_bajo_umbral_salida = 0
-                evento_registrado = self._registrar_evento(n_paquetes, fs_efectiva)
+                self._inicio_racha_salida = None
+                evento_registrado = self._iniciar_evento()
         else:
             # --- MOVIMIENTO: esperar racha de salida (con histéresis) ---
+            self._varianza_maxima_evento = max(self._varianza_maxima_evento, varianza_promedio)
             self._racha_sobre_umbral = self._racha_sobre_umbral + 1 if supera_umbral else 0
             if varianza_promedio < self.umbral_salida:
+                if self._racha_bajo_umbral_salida == 0:
+                    self._inicio_racha_salida = self._reloj()
                 self._racha_bajo_umbral_salida += 1
             else:
                 self._racha_bajo_umbral_salida = 0
+                self._inicio_racha_salida = None
 
             if self._racha_bajo_umbral_salida >= self.ventanas_confirmacion_salida:
-                self._en_movimiento = False
-                self._racha_sobre_umbral = 0
-                self._racha_bajo_umbral_salida = 0
-                self._varianza_maxima_racha = 0.0
-                logger.info(
-                    f"Fin de movimiento (usuario {self.usuario_id}): "
-                    f"{self.ventanas_confirmacion_salida} ventanas seguidas bajo el "
-                    f"umbral de salida ({self.umbral_salida:.2f})."
-                )
+                self._finalizar_evento(self._inicio_racha_salida or self._reloj())
 
         return self._armar_resultado(
             varianza_promedio, fs_efectiva, filtro_aplicado, estado_filtro,
             n_paquetes, supera_umbral=supera_umbral, evento_registrado=evento_registrado,
         )
 
-    def _registrar_evento(self, n_paquetes: int, fs_efectiva: float) -> bool:
-        """Persiste el evento de movimiento confirmado. Devuelve True si se guardó."""
-        duracion_estimada = self._estimar_duracion_segundos(
-            n_paquetes, frecuencia_muestreo=fs_efectiva
-        )
-        evento_id = insertar_evento_movimiento(
-            usuario_id=self.usuario_id,
-            varianza=self._varianza_maxima_racha,
-            duracion=duracion_estimada,
-        )
-        if evento_id is not None:
-            logger.info(
-                f"Movimiento CONFIRMADO (usuario {self.usuario_id}) tras "
-                f"{self.ventanas_confirmacion_entrada} ventanas seguidas sobre el umbral: "
-                f"varianza_max={self._varianza_maxima_racha:.4f}, "
-                f"duración≈{duracion_estimada}s -> evento #{evento_id} registrado."
-            )
-            return True
+    def _iniciar_evento(self) -> bool:
+        """
+        Abre un evento nuevo (inicio = primera ventana de la racha de
+        entrada) y se lo pasa al registro de eventos. Devuelve True si se
+        entregó al registro (la escritura en la base es asíncrona).
+        """
+        self._inicio_evento = self._inicio_racha or self._reloj()
+        self._varianza_maxima_evento = self._varianza_maxima_racha
 
-        logger.error(
-            f"Movimiento confirmado (usuario {self.usuario_id}) pero no se "
-            f"pudo registrar el evento en la base de datos."
+        logger.info(
+            f"Movimiento CONFIRMADO (usuario {self.usuario_id}) tras "
+            f"{self.ventanas_confirmacion_entrada} ventanas seguidas sobre el umbral: "
+            f"inicio={self._inicio_evento:%H:%M:%S}, "
+            f"varianza_max={self._varianza_maxima_evento:.4f}."
         )
-        return False
+        if self.registro_eventos is None:
+            return False
+        if not self.persistir_eventos:
+            logger.info("Evento no guardado: el registro de eventos está desactivado.")
+            return False
+        self._token_evento = self.registro_eventos.registrar_inicio(
+            self._inicio_evento, self._varianza_maxima_evento
+        )
+        return True
+
+    def _finalizar_evento(self, timestamp_fin: datetime) -> None:
+        """Cierra el evento en curso y vuelve el estado a reposo."""
+        inicio = self._inicio_evento or timestamp_fin
+        duracion = max((timestamp_fin - inicio).total_seconds(), 0.0)
+
+        logger.info(
+            f"Fin de movimiento (usuario {self.usuario_id}): duración≈{duracion:.1f}s, "
+            f"varianza_max={self._varianza_maxima_evento:.4f}."
+        )
+        if self.registro_eventos is not None and self._token_evento is not None:
+            self.registro_eventos.registrar_fin(
+                self._token_evento, timestamp_fin, duracion, self._varianza_maxima_evento
+            )
+        self.reiniciar_estado()
+
+    def forzar_fin_evento(self) -> None:
+        """
+        Cierra el evento en curso, si lo hay, con la hora actual como fin.
+        Se usa cuando se corta el stream de la Raspberry Pi o se detiene
+        main.py en medio de un movimiento, para no dejar el evento
+        "abierto" en la base.
+        """
+        if self._en_movimiento:
+            logger.info("Se cierra el evento de movimiento en curso por fin del stream.")
+            self._finalizar_evento(self._reloj())
+        else:
+            self.reiniciar_estado()
 
     def _armar_resultado(
         self,
@@ -814,28 +858,20 @@ class DetectorMovimiento:
             "paquetes_atipicos": self._ultimo_n_atipicos,
         }
 
-    def _estimar_duracion_segundos(
-        self, n_paquetes: int, frecuencia_muestreo: Optional[float] = None
-    ) -> int:
-        """
-        Estima la duración del evento como la duración temporal de la
-        ventana de paquetes analizada (n_paquetes / fs).
-
-        Es una aproximación deliberadamente simple para el MVP. Una
-        futura iteración podría acumular la duración real hasta detectar
-        el flanco descendente antes de persistir el evento.
-        """
-        fs = frecuencia_muestreo if frecuencia_muestreo is not None else self.frecuencia_muestreo
-        if fs is None or fs <= 0 or n_paquetes <= 0:
-            return 0
-        return max(1, round(n_paquetes / fs))
-
     def reiniciar_estado(self) -> None:
-        """Reinicia el estado confirmado a reposo y vacía las rachas."""
+        """
+        Reinicia el estado confirmado a reposo y vacía las rachas. NO
+        cierra un evento en curso en la base: para eso, `forzar_fin_evento`.
+        """
         self._en_movimiento = False
         self._racha_sobre_umbral = 0
         self._racha_bajo_umbral_salida = 0
         self._varianza_maxima_racha = 0.0
+        self._inicio_racha = None
+        self._inicio_racha_salida = None
+        self._inicio_evento = None
+        self._varianza_maxima_evento = 0.0
+        self._token_evento = None
 
 
 # ---------------------------------------------------------------------------

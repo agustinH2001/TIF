@@ -27,6 +27,7 @@ Autor: Trabajo Integrador Final - Módulo de Persistencia y Seguridad
 """
 
 import logging
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import bcrypt
@@ -244,20 +245,31 @@ def verificar_usuario(username: str, password_plana: str) -> Optional[int]:
 # Eventos de movimiento (salida del pipeline de procesamiento CSI)
 # ---------------------------------------------------------------------------
 def insertar_evento_movimiento(
-    usuario_id: int, varianza: float, duracion: int
+    usuario_id: int,
+    varianza: float,
+    duracion: Optional[float] = None,
+    timestamp_inicio: Optional[datetime] = None,
 ) -> Optional[int]:
     """
-    Registra un evento de movimiento detectado a partir del análisis de
-    la varianza de amplitud en las matrices CSI.
+    Registra el INICIO de un evento de movimiento confirmado por el
+    detector (ver `DetectorMovimiento` en signal_filter.py).
 
-    Este método lo invoca el módulo de procesamiento de señal cuando la
-    varianza máxima observada en una ventana temporal supera el
-    `umbral_sensibilidad` configurado por el usuario.
+    Ciclo de vida de un evento en `registro_movimiento`:
+        1. Al confirmarse el movimiento se inserta la fila con la hora de
+           inicio, la varianza máxima observada hasta ese momento y
+           `timestamp_fin = NULL` / `duracion_segundos = NULL`: el evento
+           queda "en curso" y la interfaz puede alertar de inmediato.
+        2. Al terminar el movimiento, `finalizar_evento_movimiento`
+           completa la hora de fin, la duración real y la varianza
+           máxima de todo el evento.
 
     Args:
         usuario_id: ID del usuario dueño del sensor.
-        varianza: varianza máxima detectada en la ventana de análisis.
-        duracion: duración en segundos del evento de movimiento.
+        varianza: varianza máxima observada hasta la confirmación.
+        duracion: duración en segundos, si ya se conoce (normalmente
+            None: se completa al finalizar el evento).
+        timestamp_inicio: momento de inicio real del movimiento (primera
+            ventana sobre el umbral). Si es None se usa NOW() del servidor.
 
     Returns:
         El ID del registro insertado, o None si ocurrió un error.
@@ -269,19 +281,29 @@ def insertar_evento_movimiento(
     cursor = None
     try:
         cursor = conexion.cursor()
-        cursor.execute(
-            """
-            INSERT INTO registro_movimiento
-                (usuario_id, timestamp, varianza_maxima, duracion_segundos)
-            VALUES (%s, NOW(), %s, %s)
-            """,
-            (usuario_id, varianza, duracion),
-        )
+        if timestamp_inicio is None:
+            cursor.execute(
+                """
+                INSERT INTO registro_movimiento
+                    (usuario_id, timestamp, varianza_maxima, duracion_segundos)
+                VALUES (%s, NOW(), %s, %s)
+                """,
+                (usuario_id, varianza, duracion),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO registro_movimiento
+                    (usuario_id, timestamp, varianza_maxima, duracion_segundos)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (usuario_id, timestamp_inicio, varianza, duracion),
+            )
         conexion.commit()
         evento_id = cursor.lastrowid
         logger.info(
-            f"Movimiento registrado (usuario {usuario_id}, "
-            f"varianza={varianza}, duración={duracion}s, id={evento_id})."
+            f"Evento de movimiento #{evento_id} iniciado (usuario {usuario_id}, "
+            f"varianza={varianza:.4f})."
         )
         return evento_id
 
@@ -293,17 +315,228 @@ def insertar_evento_movimiento(
         _cerrar(cursor, conexion)
 
 
-def obtener_historico_usuario(usuario_id: int) -> List[Dict[str, Any]]:
+def finalizar_evento_movimiento(
+    evento_id: int,
+    timestamp_fin: datetime,
+    duracion: float,
+    varianza_maxima: float,
+) -> bool:
+    """
+    Completa un evento "en curso" con su hora de fin, su duración real y
+    la varianza máxima observada durante TODO el movimiento.
+
+    Returns:
+        True si se actualizó el evento, False si no existe o hubo error.
+    """
+    conexion = conectar_db()
+    if conexion is None:
+        return False
+
+    cursor = None
+    try:
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            UPDATE registro_movimiento
+            SET timestamp_fin = %s,
+                duracion_segundos = %s,
+                varianza_maxima = GREATEST(COALESCE(varianza_maxima, 0), %s)
+            WHERE id = %s
+            """,
+            (timestamp_fin, duracion, varianza_maxima, evento_id),
+        )
+        conexion.commit()
+        if cursor.rowcount > 0:
+            logger.info(
+                f"Evento de movimiento #{evento_id} finalizado: duración={duracion:.1f}s, "
+                f"varianza_max={varianza_maxima:.4f}."
+            )
+            return True
+        logger.warning(f"No se encontró el evento #{evento_id} para finalizarlo.")
+        return False
+
+    except Error as e:
+        conexion.rollback()
+        logger.error(f"Error al finalizar el evento #{evento_id}: {e}")
+        return False
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def cerrar_eventos_abiertos(usuario_id: int) -> int:
+    """
+    Cierra los eventos que quedaron "en curso" (timestamp_fin NULL)
+    porque el proceso se interrumpió a mitad de un movimiento (cierre
+    abrupto, corte de luz, etc.). Se invoca al arrancar main.py.
+
+    Como la hora de fin real se perdió, se usa la de inicio (duración 0):
+    es preferible un dato conservador y explícito a dejar un evento
+    "en curso" para siempre, que la interfaz mostraría como alerta activa.
+
+    Returns:
+        Cantidad de eventos cerrados (0 si no había o hubo error).
+    """
+    conexion = conectar_db()
+    if conexion is None:
+        return 0
+
+    cursor = None
+    try:
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            UPDATE registro_movimiento
+            SET timestamp_fin = timestamp,
+                duracion_segundos = COALESCE(duracion_segundos, 0)
+            WHERE usuario_id = %s AND timestamp_fin IS NULL
+            """,
+            (usuario_id,),
+        )
+        conexion.commit()
+        return cursor.rowcount
+
+    except Error as e:
+        conexion.rollback()
+        logger.error(f"Error al cerrar eventos abiertos del usuario {usuario_id}: {e}")
+        return 0
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def obtener_ultimo_evento(usuario_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Devuelve el evento más reciente del usuario, o None si no tiene.
+
+    Es la consulta que usa el panel de Monitoreo cada pocos segundos:
+    trae UNA sola fila (LIMIT 1) apoyándose en el índice
+    (usuario_id, timestamp), en lugar de traer todo el histórico.
+
+    Returns:
+        Dict con {id, timestamp, timestamp_fin, varianza_maxima,
+        duracion_segundos}. `timestamp_fin` None => evento en curso.
+    """
+    conexion = conectar_db()
+    if conexion is None:
+        return None
+
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id, timestamp, timestamp_fin, varianza_maxima, duracion_segundos
+            FROM registro_movimiento
+            WHERE usuario_id = %s
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (usuario_id,),
+        )
+        return cursor.fetchone()
+
+    except Error as e:
+        logger.error(f"Error al obtener el último evento del usuario {usuario_id}: {e}")
+        return None
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def _filtro_fechas(desde: Optional[date], hasta: Optional[date]):
+    """Arma el fragmento WHERE y los parámetros para filtrar por rango de días (inclusive)."""
+    condiciones, parametros = [], []
+    if desde is not None:
+        condiciones.append("timestamp >= %s")
+        parametros.append(datetime.combine(desde, datetime.min.time()))
+    if hasta is not None:
+        condiciones.append("timestamp < DATE_ADD(%s, INTERVAL 1 DAY)")
+        parametros.append(datetime.combine(hasta, datetime.min.time()))
+    sql = "".join(f" AND {c}" for c in condiciones)
+    return sql, parametros
+
+
+def obtener_historico_usuario(
+    usuario_id: int,
+    limite: Optional[int] = None,
+    desplazamiento: int = 0,
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+) -> List[Dict[str, Any]]:
     """
     Devuelve el histórico de eventos de movimiento de un usuario,
-    ordenado del más reciente al más antiguo.
+    ordenado del más reciente al más antiguo, con paginación y filtro
+    opcional por rango de días.
 
     Args:
         usuario_id: ID del usuario.
+        limite: cantidad máxima de filas (None = todas).
+        desplazamiento: filas a saltear (para paginar).
+        desde / hasta: días límite, inclusive (None = sin límite).
 
     Returns:
-        Lista de dicts con {id, timestamp, varianza_maxima,
+        Lista de dicts con {id, timestamp, timestamp_fin, varianza_maxima,
         duracion_segundos}. Lista vacía si no hay eventos o hubo error.
+    """
+    conexion = conectar_db()
+    if conexion is None:
+        return []
+
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        sql_fechas, parametros_fechas = _filtro_fechas(desde, hasta)
+        sql = (
+            "SELECT id, timestamp, timestamp_fin, varianza_maxima, duracion_segundos "
+            "FROM registro_movimiento WHERE usuario_id = %s"
+            + sql_fechas
+            + " ORDER BY timestamp DESC, id DESC"
+        )
+        parametros: List[Any] = [usuario_id, *parametros_fechas]
+        if limite is not None:
+            sql += " LIMIT %s OFFSET %s"
+            parametros += [int(limite), int(desplazamiento)]
+        cursor.execute(sql, tuple(parametros))
+        return cursor.fetchall()
+
+    except Error as e:
+        logger.error(f"Error al obtener histórico del usuario {usuario_id}: {e}")
+        return []
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def contar_eventos_usuario(
+    usuario_id: int, desde: Optional[date] = None, hasta: Optional[date] = None
+) -> int:
+    """Cantidad total de eventos del usuario en el rango (para paginar el historial)."""
+    conexion = conectar_db()
+    if conexion is None:
+        return 0
+
+    cursor = None
+    try:
+        cursor = conexion.cursor()
+        sql_fechas, parametros_fechas = _filtro_fechas(desde, hasta)
+        cursor.execute(
+            "SELECT COUNT(*) FROM registro_movimiento WHERE usuario_id = %s" + sql_fechas,
+            (usuario_id, *parametros_fechas),
+        )
+        return int(cursor.fetchone()[0])
+
+    except Error as e:
+        logger.error(f"Error al contar eventos del usuario {usuario_id}: {e}")
+        return 0
+    finally:
+        _cerrar(cursor, conexion)
+
+
+def obtener_resumen_diario(usuario_id: int, dias: int = 30) -> List[Dict[str, Any]]:
+    """
+    Estadísticas por día de los últimos `dias` días (sólo días con eventos):
+    cantidad de eventos, duración total y varianza pico.
+
+    Returns:
+        Lista de dicts {fecha, cantidad, duracion_total, varianza_pico},
+        ordenada de la fecha más antigua a la más reciente.
     """
     conexion = conectar_db()
     if conexion is None:
@@ -314,17 +547,22 @@ def obtener_historico_usuario(usuario_id: int) -> List[Dict[str, Any]]:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT id, timestamp, varianza_maxima, duracion_segundos
+            SELECT DATE(timestamp) AS fecha,
+                   COUNT(*) AS cantidad,
+                   COALESCE(SUM(duracion_segundos), 0) AS duracion_total,
+                   MAX(varianza_maxima) AS varianza_pico
             FROM registro_movimiento
             WHERE usuario_id = %s
-            ORDER BY timestamp DESC
+              AND timestamp >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+            GROUP BY DATE(timestamp)
+            ORDER BY fecha ASC
             """,
-            (usuario_id,),
+            (usuario_id, max(int(dias) - 1, 0)),
         )
         return cursor.fetchall()
 
     except Error as e:
-        logger.error(f"Error al obtener histórico del usuario {usuario_id}: {e}")
+        logger.error(f"Error al obtener el resumen diario del usuario {usuario_id}: {e}")
         return []
     finally:
         _cerrar(cursor, conexion)
@@ -385,15 +623,17 @@ def registrar_ruta_archivo(
 def obtener_configuracion_usuario(usuario_id: int) -> Optional[Dict[str, Any]]:
     """
     Obtiene la configuración actual del detector para un usuario:
-    umbral de sensibilidad, canal Wi-Fi monitoreado y BSSID objetivo
-    (el punto de acceso cuyas tramas se analizan).
+    umbral de sensibilidad, canal Wi-Fi monitoreado, BSSID objetivo
+    (el punto de acceso cuyas tramas se analizan) y si los eventos de
+    movimiento se guardan en el historial.
 
     Args:
         usuario_id: ID del usuario.
 
     Returns:
         Dict con {usuario_id, umbral_sensibilidad, canal_wifi,
-        bssid_objetivo}, o None si no existe configuración o hubo error.
+        bssid_objetivo, guardar_eventos (bool)}, o None si no existe
+        configuración o hubo error.
     """
     conexion = conectar_db()
     if conexion is None:
@@ -404,23 +644,38 @@ def obtener_configuracion_usuario(usuario_id: int) -> Optional[Dict[str, Any]]:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT usuario_id, umbral_sensibilidad, canal_wifi, bssid_objetivo
+            SELECT usuario_id, umbral_sensibilidad, canal_wifi, bssid_objetivo,
+                   guardar_eventos
             FROM configuracion_sistema
             WHERE usuario_id = %s
             """,
             (usuario_id,),
         )
-        return cursor.fetchone()
+        config = cursor.fetchone()
+        if config is not None:
+            config["guardar_eventos"] = bool(config["guardar_eventos"])
+        return config
 
     except Error as e:
-        logger.error(f"Error al obtener configuración del usuario {usuario_id}: {e}")
+        if getattr(e, "errno", None) == 1054:  # ER_BAD_FIELD_ERROR: columna inexistente
+            logger.error(
+                "Falta la columna 'guardar_eventos' en configuracion_sistema. Ejecutá en "
+                "phpMyAdmin: ALTER TABLE configuracion_sistema ADD COLUMN guardar_eventos "
+                "TINYINT(1) NOT NULL DEFAULT 1;"
+            )
+        else:
+            logger.error(f"Error al obtener configuración del usuario {usuario_id}: {e}")
         return None
     finally:
         _cerrar(cursor, conexion)
 
 
 def actualizar_configuracion_usuario(
-    usuario_id: int, umbral: float, canal: int, bssid: Optional[str]
+    usuario_id: int,
+    umbral: float,
+    canal: int,
+    bssid: Optional[str],
+    guardar_eventos: Optional[bool] = None,
 ) -> bool:
     """
     Actualiza la configuración del detector para un usuario.
@@ -432,6 +687,8 @@ def actualizar_configuracion_usuario(
         canal: nuevo canal Wi-Fi (1-14 en 2.4GHz) a monitorear.
         bssid: MAC del punto de acceso objetivo (formato 'AA:BB:CC:DD:EE:FF'),
             o None si no se desea filtrar por BSSID.
+        guardar_eventos: si los eventos de movimiento se guardan en el
+            historial. None = no modificar el valor actual.
 
     Returns:
         True si se actualizó una fila existente, False si no existía
@@ -449,10 +706,17 @@ def actualizar_configuracion_usuario(
             UPDATE configuracion_sistema
             SET umbral_sensibilidad = %s,
                 canal_wifi = %s,
-                bssid_objetivo = %s
+                bssid_objetivo = %s,
+                guardar_eventos = COALESCE(%s, guardar_eventos)
             WHERE usuario_id = %s
             """,
-            (umbral, canal, bssid, usuario_id),
+            (
+                umbral,
+                canal,
+                bssid,
+                None if guardar_eventos is None else int(bool(guardar_eventos)),
+                usuario_id,
+            ),
         )
         conexion.commit()
 

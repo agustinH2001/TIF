@@ -13,11 +13,13 @@ Pantallas:
     2. Panel principal, con tres secciones (CTkTabview):
         - Monitoreo: tarjeta grande de estado del canal, que se
           refresca sola cada pocos segundos consultando
-          `obtener_historico_usuario` para ver si hubo un evento de
-          movimiento reciente.
+          la telemetría en vivo y `obtener_ultimo_evento`: alerta mientras
+          haya un movimiento en curso y durante unos segundos después de
+          que termina, e indica si el sensor dejó de enviar datos.
         - Configuración: muestra los parámetros actuales del usuario
-          (`obtener_configuracion_usuario`) y permite ajustar el umbral
-          de sensibilidad con un slider, persistiendo el cambio con
+          (`obtener_configuracion_usuario`), permite ajustar el umbral
+          de sensibilidad con un slider y activar o desactivar el
+          guardado de eventos en el historial, persistiendo el cambio con
           `actualizar_configuracion_usuario`.
         - Telemetría Live: recibe, por UDP local (ver
           `src/common/telemetria_ipc.py`), la varianza, la fs real y el
@@ -65,7 +67,7 @@ if str(RAIZ_PROYECTO) not in sys.path:
 from src.database.database import (
     actualizar_configuracion_usuario,
     obtener_configuracion_usuario,
-    obtener_historico_usuario,
+    obtener_ultimo_evento,
     verificar_usuario,
 )
 from src.common.telemetria_ipc import HOST_TELEMETRIA, PUERTO_TELEMETRIA, deserializar_muestra
@@ -87,9 +89,17 @@ logger = logging.getLogger("dashboard")
 # Cada cuánto se refresca automáticamente el panel de monitoreo (ms).
 INTERVALO_ACTUALIZACION_MS = 3000
 
-# Un evento se considera "reciente" (dispara la alerta roja) si ocurrió
-# dentro de esta cantidad de segundos respecto del momento de la consulta.
+# La alerta roja se mantiene mientras el movimiento esté EN CURSO y, una vez
+# terminado, durante esta cantidad de segundos contados desde su FIN.
 VENTANA_ALERTA_SEGUNDOS = 10
+
+# Si no llega telemetría de main.py en este tiempo, la tarjeta de Monitoreo
+# informa "Sensor sin datos" en lugar de "Entorno seguro".
+SEGUNDOS_SIN_TELEMETRIA_OFFLINE = 5
+
+# Al terminar un movimiento, se consulta la base tras esta demora (para dar
+# tiempo a que el hilo de registro de main.py cierre el evento).
+DEMORA_CONSULTA_FIN_EVENTO_MS = 700
 
 # Rango del slider de umbral de sensibilidad, en ESCALA LOGARÍTMICA.
 #
@@ -239,9 +249,19 @@ class FrameLogin(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 class PanelMonitoreo(ctk.CTkFrame):
     """
-    Tarjeta grande de estado del canal. Se refresca sola cada
-    `INTERVALO_ACTUALIZACION_MS` consultando el último evento de
-    movimiento del usuario (`obtener_historico_usuario`).
+    Tarjeta grande de estado del canal.
+
+    Combina dos fuentes:
+        - Telemetría en vivo (UDP, ~5 muestras/seg): el estado CONFIRMADO
+          del detector en este instante. Es la fuente principal de la
+          alerta, y funciona aunque el registro de eventos en la base
+          esté desactivado.
+        - Base de datos (`obtener_ultimo_evento`, cada
+          `INTERVALO_ACTUALIZACION_MS`): datos del último evento GUARDADO
+          (hora, duración, intensidad) para el detalle de la tarjeta.
+
+    Si no llega telemetría (main.py detenido o sin stream de la Raspberry
+    Pi), la tarjeta lo informa en lugar de mostrar "Entorno seguro".
     """
 
     def __init__(self, master, usuario_id: int):
@@ -249,9 +269,18 @@ class PanelMonitoreo(ctk.CTkFrame):
         self.usuario_id = usuario_id
         self._detenido = False
 
+        # Estado en vivo (telemetría).
+        self._momento_ultima_muestra: Optional[datetime] = None
+        self._fs_ultima_muestra: Optional[float] = None
+        self._movimiento_vivo: bool = False
+        self._inicio_vivo: Optional[datetime] = None
+        self._fin_vivo: Optional[datetime] = None
+        # Último evento guardado (base de datos).
+        self._ultimo_evento: Optional[dict] = None
+
         self.grid_columnconfigure(0, weight=1)
 
-        self.tarjeta = ctk.CTkFrame(self, corner_radius=20, fg_color=COLOR_REPOSO, height=220)
+        self.tarjeta = ctk.CTkFrame(self, corner_radius=20, fg_color=COLOR_SIN_FILTRO, height=220)
         self.tarjeta.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
         self.tarjeta.grid_propagate(False)
 
@@ -271,74 +300,147 @@ class PanelMonitoreo(ctk.CTkFrame):
         )
         self.label_detalle.place(relx=0.5, rely=0.62, anchor="center")
 
-        self.label_ultima_consulta = ctk.CTkLabel(
+        self.label_sensor = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=11), text_color="gray"
         )
-        self.label_ultima_consulta.grid(row=1, column=0, pady=(0, 10))
+        self.label_sensor.grid(row=1, column=0, pady=(0, 10))
 
         self._programar_actualizacion(inmediato=True)
 
-    # -- Ciclo de actualización ------------------------------------------
+    # -- Entrada de telemetría (hilo principal, la llama FramePrincipal) ----
+    def recibir_muestra(self, muestra: dict) -> None:
+        estaba_en_linea = self._sensor_en_linea()
+        ahora = datetime.now()
+        self._momento_ultima_muestra = ahora
+        self._fs_ultima_muestra = muestra.get("fs_estimada")
+        movimiento = bool(muestra.get("movimiento_detectado", False))
+
+        if movimiento != self._movimiento_vivo:
+            if movimiento:
+                self._inicio_vivo, self._fin_vivo = ahora, None
+            else:
+                self._fin_vivo = ahora
+                # El evento recién terminado se cierra en la base en el hilo
+                # de main.py: se consulta enseguida (sin esperar al ciclo de
+                # 3 s) para mostrar su duración e intensidad reales.
+                self.after(DEMORA_CONSULTA_FIN_EVENTO_MS, self._disparar_consulta, False)
+            self._movimiento_vivo = movimiento
+            self._renderizar()  # cambio de estado: se refleja al instante
+        elif not estaba_en_linea:
+            self._renderizar()  # el sensor volvió a enviar datos
+
+    # -- Ciclo de actualización (base de datos) ------------------------------
     def _programar_actualizacion(self, inmediato: bool = False) -> None:
         if self._detenido:
             return
         demora = 0 if inmediato else INTERVALO_ACTUALIZACION_MS
         self.after(demora, self._disparar_consulta)
 
-    def _disparar_consulta(self) -> None:
+    def _disparar_consulta(self, reprogramar: bool = True) -> None:
+        """
+        Consulta el último evento en un hilo aparte. `reprogramar=False`
+        es para consultas puntuales (fin de un movimiento) que no deben
+        abrir un segundo ciclo periódico.
+        """
         if self._detenido:
             return
-        hilo = threading.Thread(target=self._consultar_en_hilo, daemon=True)
+        hilo = threading.Thread(target=self._consultar_en_hilo, args=(reprogramar,), daemon=True)
         hilo.start()
 
-    def _consultar_en_hilo(self) -> None:
+    def _consultar_en_hilo(self, reprogramar: bool) -> None:
         """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
-            historico = obtener_historico_usuario(self.usuario_id)
+            ultimo_evento = obtener_ultimo_evento(self.usuario_id)
         except Exception as e:
-            historico = []
-            logger.error(f"Error al consultar histórico de movimiento: {e}")
+            ultimo_evento = None
+            logger.error(f"Error al consultar el último evento de movimiento: {e}")
 
-        self.after(0, self._actualizar_tarjeta, historico)
+        self.after(0, self._recibir_evento_db, ultimo_evento, reprogramar)
 
-    def _actualizar_tarjeta(self, historico: list) -> None:
+    def _recibir_evento_db(self, ultimo_evento: Optional[dict], reprogramar: bool) -> None:
         if self._detenido:
             return
+        self._ultimo_evento = ultimo_evento
+        self._renderizar()
+        if reprogramar:
+            self._programar_actualizacion()
 
-        ultimo_evento = historico[0] if historico else None
-
-        if ultimo_evento is not None:
-            antiguedad_seg = (datetime.now() - ultimo_evento["timestamp"]).total_seconds()
-        else:
-            antiguedad_seg = None
-
-        if ultimo_evento is not None and 0 <= antiguedad_seg <= VENTANA_ALERTA_SEGUNDOS:
-            self._mostrar_alerta(ultimo_evento)
-        else:
-            self._mostrar_reposo()
-
-        self.label_ultima_consulta.configure(
-            text=f"Última consulta: {datetime.now().strftime('%H:%M:%S')}"
+    # -- Composición del estado visual ---------------------------------------
+    def _sensor_en_linea(self) -> bool:
+        return (
+            self._momento_ultima_muestra is not None
+            and (datetime.now() - self._momento_ultima_muestra).total_seconds()
+            <= SEGUNDOS_SIN_TELEMETRIA_OFFLINE
         )
 
-        self._programar_actualizacion()
+    def _renderizar(self) -> None:
+        ahora = datetime.now()
+        evento = self._ultimo_evento
+        en_linea = self._sensor_en_linea()
 
-    # -- Estados visuales --------------------------------------------------
-    def _mostrar_alerta(self, evento: dict) -> None:
-        self.tarjeta.configure(fg_color=COLOR_ALERTA)
-        self.label_estado.configure(text="¡MOVIMIENTO DETECTADO!")
-        self.label_detalle.configure(
-            text=(
-                f"Varianza: {evento['varianza_maxima']:.4f}   |   "
-                f"Duración: {evento['duracion_segundos']}s   |   "
-                f"Hora: {evento['timestamp'].strftime('%H:%M:%S')}"
+        # Datos del evento guardado SOLO si corresponde al movimiento actual
+        # o al recién terminado (si el guardado está desactivado, el último
+        # evento de la base puede ser de hace horas).
+        evento_reciente = None
+        if evento is not None:
+            fin = evento.get("timestamp_fin")
+            if fin is None or (ahora - fin).total_seconds() <= VENTANA_ALERTA_SEGUNDOS:
+                evento_reciente = evento
+
+        if en_linea and self._movimiento_vivo:
+            inicio = (evento_reciente or {}).get("timestamp") or self._inicio_vivo or ahora
+            transcurrido = max((ahora - inicio).total_seconds(), 0)
+            self._pintar(
+                COLOR_ALERTA,
+                "¡MOVIMIENTO EN CURSO!",
+                f"Desde las {inicio:%H:%M:%S} ({transcurrido:.0f}s)",
             )
-        )
+        elif evento_reciente is not None and evento_reciente.get("timestamp_fin") is not None:
+            duracion = evento_reciente.get("duracion_segundos") or 0.0
+            intensidad = evento_reciente.get("varianza_maxima") or 0.0
+            self._pintar(
+                COLOR_ALERTA,
+                "¡MOVIMIENTO DETECTADO!",
+                f"Hora: {evento_reciente['timestamp']:%H:%M:%S}   |   Duración: {duracion:.1f}s"
+                f"   |   Intensidad pico: {intensidad:.2f}",
+            )
+        elif (
+            self._fin_vivo is not None
+            and (ahora - self._fin_vivo).total_seconds() <= VENTANA_ALERTA_SEGUNDOS
+        ):
+            # Movimiento recién terminado del que todavía no hay datos en
+            # la base (aún no se consultó, o el guardado está desactivado).
+            self._pintar(
+                COLOR_ALERTA,
+                "¡MOVIMIENTO DETECTADO!",
+                f"Terminó a las {self._fin_vivo:%H:%M:%S}",
+            )
+        elif not en_linea:
+            self._pintar(
+                COLOR_SIN_FILTRO,
+                "Sensor sin datos",
+                "No llega telemetría de main.py: verificá el proceso y la captura de la Raspberry Pi.",
+            )
+        else:
+            if evento is None:
+                detalle = "Todavía no hay movimientos en el historial."
+            else:
+                momento = evento.get("timestamp_fin") or evento["timestamp"]
+                formato = "%H:%M:%S" if momento.date() == ahora.date() else "%d/%m %H:%M"
+                detalle = f"Último movimiento guardado: {momento.strftime(formato)}"
+            self._pintar(COLOR_REPOSO, "Entorno Seguro / En Reposo", detalle)
 
-    def _mostrar_reposo(self) -> None:
-        self.tarjeta.configure(fg_color=COLOR_REPOSO)
-        self.label_estado.configure(text="Entorno Seguro / En Reposo")
-        self.label_detalle.configure(text="Sin movimiento detectado recientemente.")
+        if en_linea:
+            fs = self._fs_ultima_muestra
+            texto_fs = f" · {fs:.0f} Hz" if fs else ""
+            self.label_sensor.configure(text=f"Sensor: en línea{texto_fs}   ·   Actualizado {ahora:%H:%M:%S}")
+        else:
+            self.label_sensor.configure(text=f"Sensor: sin datos   ·   Actualizado {ahora:%H:%M:%S}")
+
+    def _pintar(self, color: str, titulo: str, detalle: str) -> None:
+        self.tarjeta.configure(fg_color=color)
+        self.label_estado.configure(text=titulo)
+        self.label_detalle.configure(text=detalle)
 
     def detener(self) -> None:
         """Frena el ciclo de refresco (llamar al cerrar la aplicación)."""
@@ -409,15 +511,31 @@ class PanelConfiguracion(ctk.CTkFrame):
             ),
             font=ctk.CTkFont(size=11),
             text_color="gray",
-        ).grid(row=7, column=0, sticky="w", padx=24, pady=(0, 16))
+        ).grid(row=5, column=0, sticky="w", padx=24, pady=(0, 16))
+
+        self.switch_guardar_eventos = ctk.CTkSwitch(
+            panel, text="Guardar los eventos de movimiento en el historial"
+        )
+        self.switch_guardar_eventos.grid(row=6, column=0, sticky="w", padx=24, pady=(4, 2))
+        self.switch_guardar_eventos.select()
+
+        ctk.CTkLabel(
+            panel,
+            text=(
+                "Desactivado, el sistema sigue detectando y alertando en vivo, pero no "
+                "guarda nada en la base de datos."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        ).grid(row=7, column=0, sticky="w", padx=24, pady=(0, 8))
 
         self.boton_guardar = ctk.CTkButton(
             panel, text="Guardar cambios", command=self._guardar_cambios
         )
-        self.boton_guardar.grid(row=5, column=0, sticky="w", padx=24, pady=(16, 4))
+        self.boton_guardar.grid(row=8, column=0, sticky="w", padx=24, pady=(16, 4))
 
         self.label_estado_guardado = ctk.CTkLabel(panel, text="", text_color="gray")
-        self.label_estado_guardado.grid(row=6, column=0, sticky="w", padx=24, pady=(0, 20))
+        self.label_estado_guardado.grid(row=9, column=0, sticky="w", padx=24, pady=(0, 20))
 
         self._cargar_configuracion()
 
@@ -452,6 +570,10 @@ class PanelConfiguracion(ctk.CTkFrame):
         umbral_guardado = float(config["umbral_sensibilidad"])
         self.slider_umbral.set(_umbral_a_posicion_slider(umbral_guardado))
         self.label_umbral_valor.configure(text=_formatear_umbral(umbral_guardado))
+        if config.get("guardar_eventos", True):
+            self.switch_guardar_eventos.select()
+        else:
+            self.switch_guardar_eventos.deselect()
         self.label_estado_guardado.configure(text="")
 
     def _on_slider_cambia(self, posicion: float) -> None:
@@ -470,34 +592,45 @@ class PanelConfiguracion(ctk.CTkFrame):
         nuevo_umbral = _posicion_slider_a_umbral(self.slider_umbral.get())
         canal_actual = self._config_actual["canal_wifi"]
         bssid_actual = self._config_actual["bssid_objetivo"]
+        guardar_eventos = bool(self.switch_guardar_eventos.get())
 
         self.boton_guardar.configure(state="disabled", text="Guardando...")
         self.label_estado_guardado.configure(text="")
 
         hilo = threading.Thread(
             target=self._guardar_en_hilo,
-            args=(nuevo_umbral, canal_actual, bssid_actual),
+            args=(nuevo_umbral, canal_actual, bssid_actual, guardar_eventos),
             daemon=True,
         )
         hilo.start()
 
-    def _guardar_en_hilo(self, umbral: float, canal: int, bssid: Optional[str]) -> None:
+    def _guardar_en_hilo(
+        self, umbral: float, canal: int, bssid: Optional[str], guardar_eventos: bool
+    ) -> None:
         """Corre en un hilo secundario: NO debe tocar ningún widget acá."""
         try:
-            exito = actualizar_configuracion_usuario(self.usuario_id, umbral, canal, bssid)
+            exito = actualizar_configuracion_usuario(
+                self.usuario_id, umbral, canal, bssid, guardar_eventos=guardar_eventos
+            )
         except Exception as e:
             exito = False
             logger.error(f"Error al guardar configuración: {e}")
 
-        self.after(0, self._procesar_resultado_guardado, exito, umbral)
+        self.after(0, self._procesar_resultado_guardado, exito, umbral, guardar_eventos)
 
-    def _procesar_resultado_guardado(self, exito: bool, umbral_guardado: float) -> None:
+    def _procesar_resultado_guardado(
+        self, exito: bool, umbral_guardado: float, guardar_eventos: bool
+    ) -> None:
         self.boton_guardar.configure(state="normal", text="Guardar cambios")
 
         if exito:
             self._config_actual["umbral_sensibilidad"] = umbral_guardado
+            self._config_actual["guardar_eventos"] = guardar_eventos
             self.label_estado_guardado.configure(
-                text="✔ Configuración guardada correctamente.", text_color=COLOR_EXITO
+                text=(
+                    "✔ Configuración guardada. main.py la aplica en unos segundos."
+                ),
+                text_color=COLOR_EXITO,
             )
         else:
             self.label_estado_guardado.configure(
@@ -516,7 +649,7 @@ class ReceptorTelemetria:
 
     El callback `on_muestra` se invoca DESDE ESTE HILO DE BACKGROUND —
     quien lo registre debe usar `self.after(0, ...)` para volver al
-    hilo principal (ver `PanelTelemetria._on_muestra_recibida`).
+    hilo principal (ver `FramePrincipal._on_muestra_recibida`).
     """
 
     def __init__(self, host: str, port: int, on_muestra) -> None:
@@ -651,11 +784,6 @@ class PanelTelemetria(ctk.CTkFrame):
         )
         self.label_placeholder.grid(row=3, column=0, pady=(0, 10))
 
-        self.receptor = ReceptorTelemetria(
-            host=HOST_TELEMETRIA, port=PUERTO_TELEMETRIA, on_muestra=self._on_muestra_recibida
-        )
-        self.receptor.iniciar()
-
     @staticmethod
     def _crear_lectura(master, columna: int, titulo: str):
         """Crea una lectura numérica (título chico + valor grande) en una columna del grid."""
@@ -669,13 +797,8 @@ class PanelTelemetria(ctk.CTkFrame):
 
         return label_titulo, label_valor
 
-    # -- Recepción (hilo de background) -------------------------------
-    def _on_muestra_recibida(self, muestra: dict) -> None:
-        """Corre en el hilo del ReceptorTelemetria: NO tocar widgets acá."""
-        self.after(0, self._actualizar_con_muestra, muestra)
-
-    # -- Actualización de UI (hilo principal) --------------------------
-    def _actualizar_con_muestra(self, muestra: dict) -> None:
+    # -- Actualización de UI (hilo principal, la llama FramePrincipal) ----
+    def recibir_muestra(self, muestra: dict) -> None:
         if not self._ultima_muestra_recibida:
             self._ultima_muestra_recibida = True
             self.label_placeholder.grid_remove()
@@ -793,9 +916,6 @@ class PanelTelemetria(ctk.CTkFrame):
             font=("", 10),
         )
 
-    def detener(self) -> None:
-        """Frena el hilo receptor de UDP (llamar al cerrar la aplicación)."""
-        self.receptor.detener()
 
 
 # ---------------------------------------------------------------------------
@@ -846,10 +966,27 @@ class FramePrincipal(ctk.CTkFrame):
         self.panel_telemetria = PanelTelemetria(tab_telemetria, usuario_id=usuario_id)
         self.panel_telemetria.grid(row=0, column=0, sticky="nsew")
 
+        # Un ÚNICO receptor de telemetría para toda la ventana: un puerto UDP
+        # sólo puede tener un receptor efectivo, y tanto Monitoreo como
+        # Telemetría Live necesitan las muestras. El receptor corre en un
+        # hilo de background y reenvía cada muestra al hilo principal.
+        self.receptor = ReceptorTelemetria(
+            host=HOST_TELEMETRIA, port=PUERTO_TELEMETRIA, on_muestra=self._on_muestra_recibida
+        )
+        self.receptor.iniciar()
+
+    def _on_muestra_recibida(self, muestra: dict) -> None:
+        """Corre en el hilo del ReceptorTelemetria: NO tocar widgets acá."""
+        self.after(0, self._distribuir_muestra, muestra)
+
+    def _distribuir_muestra(self, muestra: dict) -> None:
+        self.panel_monitoreo.recibir_muestra(muestra)
+        self.panel_telemetria.recibir_muestra(muestra)
+
     def detener(self) -> None:
         """Propaga la señal de detención a los sub-paneles con timers/hilos activos."""
+        self.receptor.detener()
         self.panel_monitoreo.detener()
-        self.panel_telemetria.detener()
 
 
 # ---------------------------------------------------------------------------

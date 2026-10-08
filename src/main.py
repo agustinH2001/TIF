@@ -9,7 +9,8 @@ Reemplaza a la versión anterior (que generaba ráfagas sintéticas para
 validar la lógica de DSP) ahora que el hardware ya captura datos CSI
 reales. Este orquestador:
 
-    1. Autentica al usuario y carga su configuración      (BD)
+    1. Autentica al usuario, carga su configuración y      (BD)
+       cierra eventos que hayan quedado abiertos
     2. Levanta un servidor TCP que recibe, en vivo, el      (sockets)
        stream pcap que la Raspberry Pi envía por red
     3. Reconstruye cada trama con Scapy y reutiliza los     (parser_csi)
@@ -88,7 +89,12 @@ RAIZ_PROYECTO = Path(__file__).resolve().parent.parent
 if str(RAIZ_PROYECTO) not in sys.path:
     sys.path.insert(0, str(RAIZ_PROYECTO))
 
-from src.database.database import obtener_configuracion_usuario, verificar_usuario
+from src.database.database import (
+    cerrar_eventos_abiertos,
+    obtener_configuracion_usuario,
+    verificar_usuario,
+)
+from src.database.registro_eventos import RegistroEventosAsincrono
 
 # Nota de arquitectura: `_extraer_payload_csi` y `_calcular_amplitud_fase`
 # están marcadas como privadas (prefijo "_") en parser_csi.py porque ahí
@@ -233,7 +239,8 @@ def cargar_configuracion(usuario_id: int) -> Optional[dict]:
 
     logger.info(
         f"Configuración cargada -> umbral_sensibilidad={config['umbral_sensibilidad']}, "
-        f"canal_wifi={config['canal_wifi']}, bssid_objetivo={config['bssid_objetivo']}"
+        f"canal_wifi={config['canal_wifi']}, bssid_objetivo={config['bssid_objetivo']}, "
+        f"guardar_eventos={config['guardar_eventos']}"
     )
     return config
 
@@ -270,6 +277,14 @@ def _hilo_relectura_configuracion(
                 "(se reintenta en el próximo ciclo)."
             )
             continue
+
+        nuevo_guardar = config["guardar_eventos"]
+        if nuevo_guardar != detector.persistir_eventos:
+            logger.info(
+                f"Registro de eventos {'ACTIVADO' if nuevo_guardar else 'DESACTIVADO'} "
+                f"desde el Dashboard."
+            )
+            detector.persistir_eventos = nuevo_guardar
 
         nuevo_umbral = config["umbral_sensibilidad"]
         if nuevo_umbral != detector.umbral_sensibilidad:
@@ -802,6 +817,10 @@ def _ejecutar_servidor(
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 logger.warning(f"Conexión con la Raspberry Pi interrumpida: {e}")
             finally:
+                # Si el stream se cortó en medio de un movimiento, se cierra
+                # el evento ahora: no tiene sentido dejarlo "en curso"
+                # esperando una conexión que puede tardar minutos.
+                detector.forzar_fin_evento()
                 conexion.close()
                 logger.info("Conexión cerrada. Esperando una nueva conexión...\n")
 
@@ -845,10 +864,26 @@ def main() -> None:
     if config is None:
         sys.exit(1)
 
+    # Eventos que quedaron "en curso" si el proceso anterior se cortó a
+    # mitad de un movimiento (cierre abrupto de la terminal, etc.).
+    n_cerrados = cerrar_eventos_abiertos(usuario_id)
+    if n_cerrados:
+        logger.warning(
+            f"Se cerraron {n_cerrados} evento(s) de movimiento que habían quedado abiertos "
+            f"en una ejecución anterior (se registran con duración 0)."
+        )
+
+    # Escritor de eventos en un hilo de background: el detector nunca
+    # espera a MySQL (ver src/database/registro_eventos.py).
+    registro_eventos = RegistroEventosAsincrono(usuario_id)
+    registro_eventos.iniciar()
+
     detector = DetectorMovimiento(
         usuario_id=usuario_id,
         umbral_sensibilidad=config["umbral_sensibilidad"],
         frecuencia_muestreo=FRECUENCIA_MUESTREO_DEFAULT_HZ,
+        registro_eventos=registro_eventos,
+        persistir_eventos=config["guardar_eventos"],
     )
     logger.info(
         f"DetectorMovimiento inicializado con umbral_sensibilidad="
@@ -857,7 +892,8 @@ def main() -> None:
         f"{FS_MINIMA_CONFIABLE_HZ:.0f} Hz la ventana no se filtra y el trigger se inhibe). "
         f"Confirmación: {detector.ventanas_confirmacion_entrada} ventanas para entrar, "
         f"{detector.ventanas_confirmacion_salida} bajo {detector.factor_histeresis:.0%} "
-        f"del umbral para salir."
+        f"del umbral para salir. Registro de eventos en la base: "
+        f"{'activado' if config['guardar_eventos'] else 'DESACTIVADO'}."
     )
 
     # Socket UDP de telemetría hacia el Dashboard. connect() sobre UDP no
@@ -886,6 +922,10 @@ def main() -> None:
         sys.exit(1)
     finally:
         detener_relectura.set()
+        detector.forzar_fin_evento()
+        # Ejecuta las escrituras pendientes (por ejemplo, el cierre del
+        # evento de arriba) antes de terminar el proceso.
+        registro_eventos.detener()
         sock_telemetria.close()
 
 
