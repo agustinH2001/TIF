@@ -112,6 +112,15 @@ class NotificadorWindows:
         except queue.Full:
             logger.error("Cola de alertas llena: se descarta una alerta.")
 
+    def notificar_prueba(self) -> bool:
+        """Muestra una alerta de ejemplo en el momento. Devuelve False si no hay cómo notificar."""
+        if self._mostrar_toast is None and self._reproducir_sonido is None:
+            return False
+        ahora = datetime.now()
+        self._notificar(ahora, ahora, 0.0, 0.0, titulo="Alerta de prueba",
+                        mensaje="Así se ve el aviso cuando se detecta un movimiento.")
+        return True
+
     def _procesar_cola(self) -> None:
         while True:
             pedido = self._cola.get()
@@ -119,12 +128,13 @@ class NotificadorWindows:
                 break
             self._notificar(*pedido)
 
-    def _notificar(self, inicio: datetime, fin: datetime, duracion: float, varianza_maxima: float) -> None:
-        titulo = "Movimiento detectado"
-        mensaje = (
-            f"Inicio {inicio:%H:%M:%S}  ·  Fin {fin:%H:%M:%S}\n"
-            f"Duración {duracion:.1f} s  ·  Intensidad {varianza_maxima:.2f}"
-        )
+    def _notificar(self, inicio: datetime, fin: datetime, duracion: float, varianza_maxima: float,
+                   titulo: str = "Movimiento detectado", mensaje: Optional[str] = None) -> None:
+        if mensaje is None:
+            mensaje = (
+                f"De {inicio:%H:%M:%S} a {fin:%H:%M:%S} ({duracion:.1f} s)\n"
+                f"Intensidad máxima: {varianza_maxima:.2f}"
+            )
         logger.info(f"ALERTA: {titulo}. {mensaje.replace(chr(10), ' | ')}")
 
         # Primero el toast (no bloquea) y después el sonido (bloquea unos 0.5 s)

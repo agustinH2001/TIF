@@ -4,4 +4,5 @@ numpy
 scapy
 scipy
 customtkinter
+pillow
 winotify; sys_platform == "win32"
