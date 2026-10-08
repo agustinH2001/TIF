@@ -21,6 +21,7 @@ def serializar_muestra(
     ventanas_sobre_umbral: int = 0,
     ventanas_confirmacion: int = 1,
     umbral_salida: Optional[float] = None,
+    usuario_id: Optional[int] = None,
 ) -> bytes:
     """Arma el datagrama JSON con los datos de una ventana procesada."""
     payload = {
@@ -36,6 +37,7 @@ def serializar_muestra(
         "ventanas_sobre_umbral": ventanas_sobre_umbral,
         "ventanas_confirmacion": ventanas_confirmacion,
         "umbral_salida": umbral_salida,
+        "usuario_id": usuario_id,
     }
     return json.dumps(payload).encode("utf-8")
 
