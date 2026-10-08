@@ -67,6 +67,7 @@ Ejecución:
     Como módulo:                 python -m src.main
 """
 
+import argparse
 import logging
 import socket
 import struct
@@ -173,6 +174,10 @@ MAX_PAQUETES_BUFFER_SEGURIDAD = 50_000
 # el log cuántos paquetes se acumularon hasta ahora (a lo sumo una vez
 # cada tantos segundos, para no inundar la consola).
 INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG = 5.0
+
+# Cada cuánto se imprime el resumen periódico (INFO) en lugar de una línea
+# por ventana. El detalle por ventana sigue disponible con --verbose.
+INTERVALO_RESUMEN_SEG = 10.0
 
 # Mientras las ventanas sigan sin poder filtrarse, se repite el WARNING
 # como recordatorio cada este tiempo (además del aviso en la transición).
@@ -435,6 +440,70 @@ def _procesar_paquete_crudo(datos_ethernet: bytes) -> Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 # Paso 4: Ventana deslizante + disparo del pipeline de DSP
 # ---------------------------------------------------------------------------
+class ResumenPeriodico:
+    """
+    Acumula estadísticas de las ventanas procesadas e imprime UNA línea
+    de resumen cada `INTERVALO_RESUMEN_SEG` segundos (tiempo de pared),
+    en lugar de una línea por ventana (~5 por segundo), que vuelve el log
+    ilegible en operación normal.
+
+    Sólo las ventanas filtradas entran en las estadísticas de varianza:
+    la varianza de una ventana cruda no es comparable.
+    """
+
+    def __init__(self, intervalo_seg: float = INTERVALO_RESUMEN_SEG) -> None:
+        self.intervalo_seg = intervalo_seg
+        self._reiniciar(time.time())
+
+    def _reiniciar(self, ahora: float) -> None:
+        self._inicio = ahora
+        self._n_ventanas = 0
+        self._n_filtradas = 0
+        self._n_sobre_umbral = 0
+        self._n_eventos = 0
+        self._n_atipicos = 0
+        self._varianzas: list = []
+        self._fs: list = []
+
+    def registrar(self, resultado: dict, fs_estimada: Optional[float]) -> None:
+        self._n_ventanas += 1
+        if fs_estimada is not None:
+            self._fs.append(fs_estimada)
+        if resultado["filtro_aplicado"]:
+            self._n_filtradas += 1
+            self._varianzas.append(resultado["varianza_promedio"])
+            if resultado["supera_umbral"]:
+                self._n_sobre_umbral += 1
+        if resultado["evento_registrado"]:
+            self._n_eventos += 1
+        self._n_atipicos += resultado.get("paquetes_atipicos", 0)
+
+    def emitir_si_corresponde(self, detector: DetectorMovimiento, en_movimiento: bool) -> None:
+        ahora = time.time()
+        if ahora - self._inicio < self.intervalo_seg or self._n_ventanas == 0:
+            return
+
+        if self._varianzas:
+            v = np.asarray(self._varianzas)
+            texto_var = (
+                f"varianza mediana={np.median(v):.3f} p95={np.percentile(v, 95):.3f} "
+                f"máx={v.max():.3f}"
+            )
+        else:
+            texto_var = "varianza=N/D (ninguna ventana filtrada)"
+        texto_fs = f"{np.median(self._fs):.0f}Hz" if self._fs else "N/D"
+        pct_filtradas = 100.0 * self._n_filtradas / self._n_ventanas
+
+        logger.info(
+            f"[Resumen {ahora - self._inicio:.0f}s] estado={'MOVIMIENTO' if en_movimiento else 'reposo'} | "
+            f"ventanas={self._n_ventanas} ({pct_filtradas:.0f}% filtradas) | fs={texto_fs} | "
+            f"{texto_var} | umbral={detector.umbral_sensibilidad:.3f} "
+            f"(salida {detector.umbral_salida:.3f}) | sobre_umbral={self._n_sobre_umbral} | "
+            f"paquetes_atipicos={self._n_atipicos} | eventos_nuevos={self._n_eventos}"
+        )
+        self._reiniciar(ahora)
+
+
 def _procesar_stream(
     conexion: socket.socket,
     detector: DetectorMovimiento,
@@ -471,6 +540,14 @@ def _procesar_stream(
     n_paquetes_csi = 0
     n_paquetes_descartados = 0
     n_ventanas_desde_ultima_relectura = 0
+    resumen = ResumenPeriodico()
+
+    # Aviso de ventana lenta: se mide cuánto tiempo DE PARED lleva el
+    # sistema esperando completar la próxima ventana, y sólo se avisa si
+    # esa espera supera INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG. (Antes se
+    # avisaba con el primer paquete después de CADA ventana, lo que
+    # llenaba el log aunque la tasa fuera perfectamente normal.)
+    momento_inicio_espera: float = time.time()
     momento_ultimo_aviso_lento: Optional[float] = None
 
     # Seguimiento del estado del filtro para avisar sólo en transiciones.
@@ -518,12 +595,14 @@ def _procesar_stream(
 
         if duracion_acumulada < DURACION_VENTANA_SEG:
             ahora = time.time()
-            if (
+            espera_larga = (ahora - momento_inicio_espera) >= INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG
+            if espera_larga and (
                 momento_ultimo_aviso_lento is None
                 or (ahora - momento_ultimo_aviso_lento) >= INTERVALO_AVISO_VENTANA_INCOMPLETA_SEG
             ):
-                logger.info(
-                    f"Acumulando paquetes para completar una ventana de "
+                logger.warning(
+                    f"Tasa de paquetes baja: hace {ahora - momento_inicio_espera:.0f}s que "
+                    f"no se completa una ventana. Acumulando paquetes para completar una ventana de "
                     f"{DURACION_VENTANA_SEG:.1f}s reales: llevamos "
                     f"{len(buffer_ventana)} paquetes CSI válidos "
                     f"({duracion_acumulada:.2f}s de datos reales). Si esto tarda "
@@ -538,7 +617,11 @@ def _procesar_stream(
         resultado, fs_estimada = _procesar_ventana_completa(
             buffer_ventana, detector, sock_telemetria, n_paquetes_csi, n_paquetes_descartados
         )
+        momento_inicio_espera = time.time()
         momento_ultimo_aviso_lento = None
+
+        resumen.registrar(resultado, fs_estimada)
+        resumen.emitir_si_corresponde(detector, resultado["movimiento_detectado"])
 
         # --- Aviso explícito del fallback de filtrado ---------------------
         estado_filtro = resultado["estado_filtro"]
@@ -627,14 +710,17 @@ def _procesar_ventana_completa(
     else:
         estado_legible = "reposo"
 
+    # Detalle por ventana: sólo con --verbose (nivel DEBUG). En operación
+    # normal lo reemplaza el resumen periódico de ResumenPeriodico.
     texto_fs = f"{fs_estimada:.1f}Hz" if fs_estimada is not None else "N/D"
-    logger.info(
+    logger.debug(
         f"[Ventana procesada] estado={estado_legible} | "
         f"filtro={resultado['estado_filtro']} | "
         f"varianza={resultado['varianza_promedio']:.4f} | "
         f"umbral={detector.umbral_sensibilidad:.2f} "
         f"(salida {detector.umbral_salida:.2f}) | "
         f"evento_nuevo_en_BD={resultado['evento_registrado']} | "
+        f"atipicos={resultado['paquetes_atipicos']} | "
         f"fs_real={texto_fs} | n_ventana={resultado['n_paquetes']} | "
         f"paquetes_csi_totales={n_paquetes_csi} | descartados={n_paquetes_descartados}"
     )
@@ -723,7 +809,29 @@ def _ejecutar_servidor(
 # ---------------------------------------------------------------------------
 # Orquestación principal
 # ---------------------------------------------------------------------------
+def _parsear_argumentos() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Orquestador en vivo del sistema de detección de movimiento por CSI Wi-Fi."
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Muestra una línea de log por cada ventana procesada (~5 por segundo), "
+             "además del resumen periódico. Útil para diagnóstico fino.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    argumentos = _parsear_argumentos()
+    if argumentos.verbose:
+        # Sólo los loggers propios: subir el root a DEBUG traería también
+        # el ruido interno de mysql-connector y scapy.
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("signal_filter").setLevel(logging.DEBUG)
+        for handler in logging.getLogger().handlers:
+            handler.setLevel(logging.DEBUG)
+
     print("=" * 72)
     print(" SISTEMA DE DETECCIÓN PASIVA DE MOVIMIENTO POR CSI WI-FI")
     print(" Orquestador principal (src/main.py) - MODO EN VIVO (streaming TCP)")

@@ -57,6 +57,7 @@ import logging
 from typing import Optional, Tuple
 
 import numpy as np
+from scipy.ndimage import median_filter
 from scipy.signal import butter, sosfiltfilt
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,169 @@ ORDEN_FILTRO_DEFAULT = 4
 # controlado recomendado (iperf3 UDP a ~200 pps) se trabaja muy por
 # encima de este piso.
 FS_MINIMA_CONFIABLE_HZ = 30.0
+
+# ---------------------------------------------------------------------------
+# Preprocesamiento de amplitudes (antes del filtro)
+# ---------------------------------------------------------------------------
+# Subportadoras ÚTILES para CSI a 20 MHz (64 bins de FFT, en el orden
+# natural en que los entrega Nexmon: 0 = DC, 1..31 positivas, 32..63
+# negativas).
+#
+# Al decodificar una trama real de esta misma placa (la de
+# utils/generar_pcap.py) se ve que los bins 0 (DC) y 28..35 (guarda y
+# bordes de banda) NO contienen canal sino valores basura del chip, de
+# hasta ~33.000, contra ~300-600 de las subportadoras de datos. Esos
+# pocos bins dominaban por completo la "varianza promedio": cambian de
+# forma errática entre tramas (y según la trama sea legacy 802.11a/g,
+# con datos en ±1..±26, o HT/802.11n, con datos en ±1..±28), y producían
+# varianzas de miles a decenas de miles con saltos bruscos, sin relación
+# con el movimiento.
+#
+# Se conservan sólo ±1..±26 (índices 1..26 y 38..63): son las 52
+# subportadoras que tienen canal real en AMBOS tipos de trama, así el
+# conjunto no depende de qué tipo de trama transmita el módem.
+SUBPORTADORAS_UTILES_20MHZ = np.r_[1:27, 38:64]
+
+# Normalización por paquete: cada vector de amplitudes se divide por su
+# media (sobre las subportadoras útiles) y se expresa en porcentaje.
+# Elimina los saltos de escala COMUNES a todas las subportadoras de una
+# trama (ganancia automática del receptor, potencia de transmisión, MCS
+# distinto según a qué cliente le hable el módem), que no son movimiento
+# pero inflan la varianza. Lo que queda es la FORMA del canal en
+# frecuencia, que es lo que perturba un cuerpo en movimiento.
+NORMALIZAR_POR_PAQUETE = True
+
+# Rechazo de paquetes atípicos POR FORMA (antes del Hampel).
+#
+# En vivo se observaron falsos positivos confirmados causados por
+# RÁFAGAS de varios paquetes corruptos seguidos (probablemente tramas del
+# módem con otra configuración de transmisión). El Hampel, con ventana de
+# 7, sólo puede limpiar hasta 3 consecutivos; una ráfaga de 6 paquetes
+# producía varianza ~14 y una de 15, ~85 (contra ~2 de un movimiento real),
+# y como la ráfaga permanece dentro de la ventana deslizante durante ~2 s,
+# completaba la confirmación de 3 ventanas.
+#
+# Criterio: cada paquete (ya normalizado, en %) se compara con el perfil
+# MEDIANO de la ventana. Su desvío es el promedio, sobre las
+# subportadoras, de |paquete - perfil_mediano|. Se marca atípico si su
+# desvío supera a la vez:
+#   - FACTOR_RECHAZO_PAQUETE veces el desvío típico (mediana) de los
+#     paquetes de esa misma ventana, y
+#   - DESVIO_MINIMO_RECHAZO_PCT en términos absolutos.
+# Un movimiento real deforma el perfil de forma GRADUAL y a todos los
+# paquetes de la ventana por igual, así que sube también el desvío
+# típico de referencia y no dispara el rechazo; un paquete corrupto se
+# aparta del resto de golpe. Los paquetes atípicos se reemplazan por el
+# perfil mediano (no se eliminan, para no romper el muestreo uniforme).
+# Si más de la mitad de la ventana resultara atípica, no se toca nada:
+# en ese caso la "mediana" ya no representa el estado normal.
+FACTOR_RECHAZO_PAQUETE = 5.0
+DESVIO_MINIMO_RECHAZO_PCT = 10.0
+
+# Filtro de Hampel en el eje temporal (por subportadora): reemplaza por
+# la mediana local cada muestra que se aleja más de N desvíos robustos
+# (MAD) de ella. Elimina impulsos de una o pocas tramas (tramas
+# corruptas, picos de AGC) antes de que el pasabanda los "desparrame"
+# sobre varias ventanas.
+HAMPEL_VENTANA_MUESTRAS = 7     # ~50 ms a ~140 Hz
+HAMPEL_N_SIGMAS = 3.0
+
+
+def rechazar_paquetes_atipicos(
+    matriz: np.ndarray,
+    factor: float = FACTOR_RECHAZO_PAQUETE,
+    desvio_minimo_pct: float = DESVIO_MINIMO_RECHAZO_PCT,
+) -> Tuple[np.ndarray, int]:
+    """
+    Reemplaza por el perfil mediano de la ventana los paquetes cuya forma
+    se aparta bruscamente del resto (ver `FACTOR_RECHAZO_PAQUETE`).
+    Espera amplitudes ya normalizadas por paquete (en %).
+
+    Returns:
+        Tupla (matriz_limpia, cantidad_de_paquetes_reemplazados).
+    """
+    if matriz.shape[0] < 3:
+        return matriz, 0
+
+    perfil_mediano = np.median(matriz, axis=0)
+    desvio_por_paquete = np.mean(np.abs(matriz - perfil_mediano), axis=1)
+    desvio_tipico = float(np.median(desvio_por_paquete))
+    limite = max(factor * desvio_tipico, desvio_minimo_pct)
+
+    atipicos = desvio_por_paquete > limite
+    n_atipicos = int(atipicos.sum())
+    if n_atipicos == 0 or n_atipicos > matriz.shape[0] // 2:
+        return matriz, 0
+
+    matriz = matriz.copy()
+    matriz[atipicos] = perfil_mediano
+    return matriz, n_atipicos
+
+
+def preprocesar_amplitudes(
+    matriz_amplitud: np.ndarray,
+    normalizar: bool = NORMALIZAR_POR_PAQUETE,
+    hampel_ventana: int = HAMPEL_VENTANA_MUESTRAS,
+    hampel_n_sigmas: float = HAMPEL_N_SIGMAS,
+    rechazar_atipicos: bool = True,
+    devolver_conteo: bool = False,
+):
+    """
+    Limpia la matriz de amplitudes CSI (n_paquetes, n_subportadoras)
+    antes del pasabanda:
+
+        1. Descarta los bins sin canal (DC, guarda, bordes) si la matriz
+           tiene 64 subportadoras (20 MHz). Para otros anchos de banda se
+           conservan todas (todavía no validado con hardware).
+        2. Normaliza cada paquete por su amplitud media (en %), si
+           `normalizar` es True.
+        3. Reemplaza los paquetes atípicos por forma (ráfagas de tramas
+           corruptas), si `rechazar_atipicos` es True y se normalizó.
+        4. Aplica un filtro de Hampel a lo largo del tiempo, si
+           `hampel_ventana` >= 3.
+
+    Función pura, sin efectos secundarios. Devuelve una matriz nueva o,
+    si `devolver_conteo` es True, la tupla (matriz, n_paquetes_atipicos).
+    """
+    if matriz_amplitud.size == 0 or matriz_amplitud.ndim != 2:
+        return (matriz_amplitud, 0) if devolver_conteo else matriz_amplitud
+
+    matriz = np.asarray(matriz_amplitud, dtype=np.float64)
+
+    if matriz.shape[1] == 64:
+        matriz = matriz[:, SUBPORTADORAS_UTILES_20MHZ]
+
+    if normalizar:
+        media_por_paquete = matriz.mean(axis=1, keepdims=True)
+        media_por_paquete[media_por_paquete <= 0] = 1.0  # paquete nulo: no dividir por 0
+        matriz = 100.0 * matriz / media_por_paquete
+
+    n_atipicos = 0
+    if rechazar_atipicos and normalizar:
+        matriz, n_atipicos = rechazar_paquetes_atipicos(matriz)
+
+    if hampel_ventana >= 3 and matriz.shape[0] >= hampel_ventana:
+        # IMPORTANTE: mode="mirror" y NO "nearest". Con "nearest", el
+        # borde se rellena REPITIENDO la última muestra; si justo el
+        # paquete más reciente de la ventana es un paquete corrupto, el
+        # relleno lo replica 3 veces y el corrupto pasa a ser mayoría en
+        # su propia vecindad: la mediana local ES el valor corrupto y el
+        # Hampel no lo detecta. El pasabanda (sosfiltfilt) amplifica
+        # además lo que hay en los bordes, y el resultado era un pico de
+        # varianza de 40 a 1.600 en UNA sola ventana (en la siguiente el
+        # paquete ya no está en el borde y se limpia bien), observado en
+        # vivo como "Pico descartado: 1 ventana(s)". Con "mirror" el
+        # relleno refleja las muestras vecinas sin repetir la del borde,
+        # y el paquete corrupto queda en minoría como cualquier otro.
+        mediana = median_filter(matriz, size=(hampel_ventana, 1), mode="mirror")
+        desvio_abs = np.abs(matriz - mediana)
+        mad = median_filter(desvio_abs, size=(hampel_ventana, 1), mode="mirror")
+        limite = hampel_n_sigmas * 1.4826 * mad
+        atipicos = desvio_abs > np.maximum(limite, 1e-12)
+        matriz = np.where(atipicos, mediana, matriz)
+
+    return (matriz, n_atipicos) if devolver_conteo else matriz
+
 
 # ---------------------------------------------------------------------------
 # Confirmación temporal del trigger (anti-picos) + histéresis
@@ -463,6 +627,8 @@ class DetectorMovimiento:
         # Varianza máxima observada durante la racha de entrada actual
         # (es la que se persiste como `varianza_maxima` del evento).
         self._varianza_maxima_racha: float = 0.0
+        # Paquetes atípicos reemplazados en la última ventana (diagnóstico).
+        self._ultimo_n_atipicos: int = 0
 
     @property
     def umbral_salida(self) -> float:
@@ -514,8 +680,16 @@ class DetectorMovimiento:
         )
         n_paquetes = int(matriz_amplitud.shape[0]) if matriz_amplitud.ndim > 0 else 0
 
+        # Limpieza previa (bins basura, escala por paquete, impulsos). Se
+        # hace ANTES de decidir si la ventana se puede filtrar, para que
+        # la varianza cruda reportada en ventanas no filtradas también
+        # sea la de la señal limpia.
+        matriz_limpia, self._ultimo_n_atipicos = preprocesar_amplitudes(
+            matriz_amplitud, devolver_conteo=True
+        )
+
         matriz_procesada, estado_filtro = filtrar_señal_butterworth(
-            matriz_amplitud,
+            matriz_limpia,
             frecuencia_muestreo=fs_efectiva,
             freq_corte_baja=self.freq_corte_baja,
             freq_corte_alta=self.freq_corte_alta,
@@ -549,9 +723,13 @@ class DetectorMovimiento:
                 self._varianza_maxima_racha = max(self._varianza_maxima_racha, varianza_promedio)
             else:
                 if self._racha_sobre_umbral > 0:
-                    logger.debug(
+                    # Se informa a nivel INFO: es justamente el dato para
+                    # diagnosticar falsos positivos (duración y magnitud de
+                    # los picos que el filtro de confirmación frenó).
+                    logger.info(
                         f"Pico descartado: {self._racha_sobre_umbral} ventana(s) sobre el "
-                        f"umbral, se necesitaban {self.ventanas_confirmacion_entrada}."
+                        f"umbral (máx {self._varianza_maxima_racha:.3f}), se necesitaban "
+                        f"{self.ventanas_confirmacion_entrada} para confirmar."
                     )
                 self._racha_sobre_umbral = 0
                 self._varianza_maxima_racha = 0.0
@@ -633,6 +811,7 @@ class DetectorMovimiento:
             "filtro_aplicado": filtro_aplicado,
             "estado_filtro": estado_filtro,
             "n_paquetes": n_paquetes,
+            "paquetes_atipicos": self._ultimo_n_atipicos,
         }
 
     def _estimar_duracion_segundos(
@@ -669,24 +848,35 @@ if __name__ == "__main__":
     FS_SIMULADA = 140.0        # Hz, similar a lo medido con iperf3
     N_SUBPORTADORAS = 64
     DURACION_VENTANA_SEG = 2
-    UMBRAL_DEMO = 450.0
+    UMBRAL_DEMO = 2.0
 
     n = int(FS_SIMULADA * DURACION_VENTANA_SEG)
     t = np.arange(n) / FS_SIMULADA
     rng = np.random.default_rng(seed=42)
 
-    def ventana(amplitud_movimiento: float) -> np.ndarray:
-        base = 100.0 + rng.normal(0, 0.5, size=(n, N_SUBPORTADORAS))
-        mov = amplitud_movimiento * np.sin(2 * np.pi * 1.2 * t)
-        return base + mov[:, np.newaxis]
+    # Perfil de canal plausible + saltos de ganancia por paquete (AGC)
+    # + bins basura en DC/guarda, como en las tramas reales de la placa.
+    perfil = 400.0 + 150.0 * np.cos(np.linspace(0, 2 * np.pi, N_SUBPORTADORAS))
+    patron_espacial = np.sin(np.linspace(0, 6 * np.pi, N_SUBPORTADORAS))
+
+    def ventana(intensidad_movimiento: float) -> np.ndarray:
+        m = perfil * (1 + 0.01 * rng.normal(size=(n, N_SUBPORTADORAS)))
+        m *= rng.choice([1.0, 1.0, 1.0, 1.35, 0.8], size=(n, 1))   # AGC
+        m[:, [0, 28, 29, 30, 31, 32, 33, 34, 35]] = rng.uniform(0, 35000, size=(n, 9))
+        # El movimiento perturba el canal de forma SELECTIVA en frecuencia
+        # (distinto en cada subportadora); una variación idéntica en todas
+        # sería indistinguible de un cambio de ganancia y la normalización
+        # la eliminaría a propósito.
+        mov = intensidad_movimiento * np.sin(2 * np.pi * 1.2 * t)
+        return m * (1 + mov[:, np.newaxis] * patron_espacial[np.newaxis, :])
 
     detector = DetectorMovimiento(usuario_id=1, umbral_sensibilidad=UMBRAL_DEMO)
 
     secuencia = (
         [("reposo", 0.0)] * 3
-        + [("PICO aislado", 40.0)]
+        + [("PICO aislado", 0.08)]
         + [("reposo", 0.0)] * 2
-        + [("movimiento", 40.0)] * 5
+        + [("movimiento", 0.08)] * 5
         + [("reposo", 0.0)] * 6
     )
 

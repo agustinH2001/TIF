@@ -94,16 +94,17 @@ VENTANA_ALERTA_SEGUNDOS = 10
 # Rango del slider de umbral de sensibilidad, en ESCALA LOGARÍTMICA.
 #
 # El rango original (0-10) se había definido antes de conocer la escala
-# real de la varianza filtrada; con hardware real y tráfico iperf3 la
-# varianza en reposo ronda los cientos y con movimiento supera el millar,
-# y ese valor además depende de la distancia entre equipos, la ganancia
-# del chip y el entorno. Una escala logarítmica (1 a 10.000) cubre cuatro
-# órdenes de magnitud con la misma resolución RELATIVA en todo el rango
-# (cada paso del slider mueve el umbral ~2.3%), en vez de quedar
-# o muy grueso en valores bajos o muy fino en valores altos.
-UMBRAL_MIN = 1.0
+# real de la varianza filtrada. Desde que signal_filter.py normaliza cada
+# paquete (amplitud en % de su media), la varianza queda en %^2: del
+# orden de décimas en reposo y de unidades a decenas con movimiento, y
+# su valor exacto depende de la distancia entre equipos y del entorno.
+# Una escala logarítmica (0.01 a 10.000) cubre seis órdenes de magnitud
+# con la misma resolución RELATIVA en todo el rango (cada paso del
+# slider mueve el umbral ~2.3%), en vez de quedar o muy grueso en
+# valores bajos o muy fino en valores altos.
+UMBRAL_MIN = 0.01
 UMBRAL_MAX = 10_000.0
-PASOS_SLIDER_UMBRAL = 400
+PASOS_SLIDER_UMBRAL = 600
 
 COLOR_ALERTA = "#c0392b"      # rojo
 COLOR_REPOSO = "#27ae60"      # verde
@@ -136,12 +137,18 @@ def _posicion_slider_a_umbral(posicion: float) -> float:
         return float(round(valor))
     if valor >= 10:
         return round(valor, 1)
-    return round(valor, 2)
+    if valor >= 1:
+        return round(valor, 2)
+    return round(valor, 3)
 
 
 def _formatear_umbral(valor: float) -> str:
     """Formato legible para mostrar el umbral en etiquetas."""
-    return f"{valor:.0f}" if valor >= 100 else f"{valor:.2f}"
+    if valor >= 100:
+        return f"{valor:.0f}"
+    if valor >= 1:
+        return f"{valor:.2f}"
+    return f"{valor:.3f}"
 
 
 # ---------------------------------------------------------------------------
